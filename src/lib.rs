@@ -3,6 +3,7 @@ pub mod diagnostics;
 pub mod document_session;
 pub mod editor_navigation;
 pub mod file_monitor;
+pub mod i18n;
 pub mod platform;
 pub mod search;
 pub mod settings;

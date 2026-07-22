@@ -1,6 +1,6 @@
 [package]
 name = "game-config-edit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A desktop CSV configuration editor for game development"
 repository = "https://github.com/TheShowMy/game_config_edit"
@@ -21,6 +21,7 @@ notify = "8.2"
 rfd = { version = "0.15", features = ["common-controls-v6"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
+sys-locale = "0.3.2"
 thiserror = "2.0"
 tempfile = "3.23"
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }

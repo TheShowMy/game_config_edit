@@ -72,6 +72,12 @@ input {
   background: #343c46;
 }
 
+.titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .banner {
   min-height: 30px;
   padding: 6px 14px;
@@ -684,11 +690,15 @@ input {
   max-width: var(--focus-column-width);
 }
 
-.focus-table .focus-neighbor {
-  width: 180px;
-  min-width: 180px;
-  max-width: 180px;
+.focus-table .focus-left-neighbor,
+.focus-table .focus-right-neighbor {
   color: #a7b0bd;
+}
+
+.focus-table .focus-side-spacer {
+  padding: 0;
+  border-right: 0;
+  background: #11151b;
 }
 
 .focus-table tbody tr:not(.virtual-spacer) > th,
@@ -864,8 +874,95 @@ input {
 }
 
 .command-panel,
-.global-search-panel {
+.global-search-panel,
+.shortcuts-panel {
   flex-direction: column;
+}
+
+.shortcuts-panel {
+  width: min(720px, calc(100vw - 36px));
+}
+
+.shortcuts-header {
+  display: flex;
+  min-height: 46px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px 0 16px;
+  border-bottom: 1px solid #343a43;
+}
+
+.shortcuts-header h1,
+.shortcut-group h2 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+.shortcuts-header h1 {
+  font-size: 14px;
+}
+
+.shortcuts-content {
+  display: grid;
+  min-height: 0;
+  overflow: auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.shortcut-group {
+  padding: 14px 16px;
+  border-right: 1px solid #343a43;
+  border-bottom: 1px solid #343a43;
+}
+
+.shortcut-group:nth-child(2n) {
+  border-right: 0;
+}
+
+.shortcut-group h2 {
+  margin-bottom: 8px;
+  color: #9ba8b7;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.shortcut-group dl {
+  margin: 0;
+}
+
+.shortcut-row {
+  display: grid;
+  min-height: 26px;
+  align-items: center;
+  gap: 12px;
+  grid-template-columns: minmax(110px, auto) minmax(0, 1fr);
+}
+
+.shortcut-row dt,
+.shortcut-row dd {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+.shortcut-row dt {
+  color: #d8dee9;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+}
+
+.shortcut-row dd {
+  color: #9ba8b7;
+  font-size: 11px;
+}
+
+@media (max-width: 640px) {
+  .shortcuts-content {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .shortcut-group {
+    border-right: 0;
+  }
 }
 
 .line-panel {

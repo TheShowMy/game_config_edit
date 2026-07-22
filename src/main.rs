@@ -20,7 +20,12 @@ use game_config_edit::editor_navigation::{
     move_in_grid,
 };
 use game_config_edit::file_monitor::WorkspaceMonitor;
-use game_config_edit::platform::{reveal_in_file_manager, reveal_label};
+use game_config_edit::i18n::{
+    CloseAction, Count, Message, SHORTCUTS, ShortcutGroup, Text, count, csv_parse_failed,
+    header_requirement, message as l10n, physical_lines, records_columns, search_summary,
+    shortcut_keys, text as tr, unsearchable_files,
+};
+use game_config_edit::platform::reveal_in_file_manager;
 use game_config_edit::search::{
     CellSearchMatch, GlobalSearchEvent, GlobalSearchMatch, TextSearchMatch, find_cell_matches,
     find_text_matches, rank_files, stream_workspace_search,
@@ -30,8 +35,8 @@ use game_config_edit::settings::{
 };
 use game_config_edit::startup::{StartupDecision, resolve_startup, validate_workspace};
 use game_config_edit::table_virtualization::{
-    DATA_ROW_HEIGHT, FOCUS_DATA_ROW_HEIGHT, TableViewport, spacer_heights_with_height,
-    visible_row_range_with_height,
+    DATA_ROW_HEIGHT, FOCUS_DATA_ROW_HEIGHT, FocusColumnRole, FocusLayout, TableViewport,
+    spacer_heights_with_height, visible_row_range_with_height,
 };
 use game_config_edit::workspace::{
     CsvFileEntry, CsvFileStats, WorkspaceSnapshot, WorkspaceTreeRow, inspect_csv_file,
@@ -134,11 +139,19 @@ enum ExternalChangeAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CellClickAction {
+    Select,
+    SwitchFocus,
+    Edit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverlayPanel {
     CommandPalette,
     GoToLine,
     CurrentSearch,
     GlobalSearch,
+    Shortcuts,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -164,11 +177,18 @@ struct GlobalSearchState {
     warning_count: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 struct TextCursorPosition {
     path: PathBuf,
     line: usize,
     column: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct TableViewportSize {
+    path: PathBuf,
+    width: f64,
+    height: f64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,13 +289,14 @@ struct OverlayContext {
     notice: Signal<Option<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum WindowShortcutCommand {
     CommandPalette,
     GoToLine,
     CurrentSearch,
     GlobalSearch,
+    Shortcuts,
     Save,
     Close,
     CloseReleased,
@@ -289,6 +310,7 @@ enum WindowShortcutCommand {
     Copied,
     Paste(String),
     TextCursor(TextCursorPosition),
+    TableViewport(TableViewportSize),
 }
 
 fn main() {
@@ -354,7 +376,7 @@ fn build_bootstrap(explicit_workspace: Option<PathBuf>) -> Bootstrap {
 
 fn choose_workspace() -> Option<PathBuf> {
     FileDialog::new()
-        .set_title("Open CSV configuration folder")
+        .set_title(tr(Text::OpenCsvFolder))
         .pick_folder()
         .and_then(|path| validate_workspace(&path).ok())
 }
@@ -363,8 +385,11 @@ fn show_startup_error(message: &str) {
     eprintln!("gconf: {message}");
     let _ = MessageDialog::new()
         .set_level(MessageLevel::Error)
-        .set_title("Game Config Edit")
-        .set_description(message)
+        .set_title(tr(Text::AppTitle))
+        .set_description(l10n(Message::Technical {
+            prefix: Text::StartupError,
+            detail: message,
+        }))
         .show();
 }
 
@@ -396,7 +421,7 @@ fn App() -> Element {
     let sidebar_visible = use_signal(|| true);
     let mut external_conflicts = use_signal(HashSet::<PathBuf>::new);
     let mut external_reload_errors = use_signal(HashMap::<PathBuf, String>::new);
-    let overlay_panel = use_signal(|| None::<OverlayPanel>);
+    let mut overlay_panel = use_signal(|| None::<OverlayPanel>);
     let command_palette = use_signal(CommandPaletteState::default);
     let go_to_line = use_signal(String::new);
     let current_search = use_signal(CurrentSearchState::default);
@@ -433,7 +458,7 @@ fn App() -> Element {
                 diagnostic_target,
                 table_analyses,
                 notice,
-                "closing the window",
+                CloseAction::Window,
             ) {
                 desktop.set_close_behavior(WindowCloseBehaviour::WindowCloses);
             } else {
@@ -562,10 +587,10 @@ fn App() -> Element {
             let columns = match result {
                 Ok(columns) => columns,
                 Err(error) => {
-                    notice.set(Some(format!(
-                        "Table analysis failed for {}: {error}",
-                        file_name(&path)
-                    )));
+                    notice.set(Some(l10n(Message::TableAnalysisFailed {
+                        file: &file_name(&path),
+                        detail: &error.to_string(),
+                    })));
                     table_analyses.write().remove(&path);
                     return;
                 }
@@ -719,10 +744,7 @@ fn App() -> Element {
                         ExternalChangeAction::Reload => {}
                         ExternalChangeAction::Conflict => {
                             external_conflicts.write().insert(path.clone());
-                            notice.set(Some(format!(
-                                "{} changed on disk while it has unsaved edits",
-                                file_name(&path)
-                            )));
+                            notice.set(Some(l10n(Message::ExternalConflict(&file_name(&path)))));
                             continue;
                         }
                     }
@@ -738,20 +760,20 @@ fn App() -> Element {
                             external_reload_errors
                                 .write()
                                 .insert(path.clone(), error.to_string());
-                            notice.set(Some(format!(
-                                "Could not reload {}: {error}",
-                                file_name(&path)
-                            )));
+                            notice.set(Some(l10n(Message::ReloadFailed {
+                                file: &file_name(&path),
+                                detail: &error.to_string(),
+                            })));
                             continue;
                         }
                         Err(error) => {
                             external_reload_errors
                                 .write()
                                 .insert(path.clone(), error.to_string());
-                            notice.set(Some(format!(
-                                "Could not reload {}: {error}",
-                                file_name(&path)
-                            )));
+                            notice.set(Some(l10n(Message::ReloadFailed {
+                                file: &file_name(&path),
+                                detail: &error.to_string(),
+                            })));
                             continue;
                         }
                     };
@@ -795,10 +817,7 @@ fn App() -> Element {
                     }
                     external_conflicts.write().remove(&path);
                     external_reload_errors.write().remove(&path);
-                    notice.set(Some(format!(
-                        "Reloaded {} after an external change",
-                        file_name(&path)
-                    )));
+                    notice.set(Some(l10n(Message::ExternalReloaded(&file_name(&path)))));
                 }
 
                 let previous_paths = scan
@@ -900,6 +919,8 @@ fn App() -> Element {
                     command = "redo";
                 } else if (event.key === "F8") {
                     command = event.shiftKey ? "previous_diagnostic" : "next_diagnostic";
+                } else if (!editingText && event.key === "F1") {
+                    command = "shortcuts";
                 }
 
                 if (command !== null) {
@@ -947,12 +968,59 @@ fn App() -> Element {
                     column: Array.from(lines.at(-1) ?? "").length + 1,
                 }});
             };
+            const observedTables = new Set();
+            const sendTableSize = (table) => {
+                dioxus.send({table_viewport: {
+                    path: table.dataset.path ?? "",
+                    width: table.clientWidth,
+                    height: table.clientHeight,
+                }});
+            };
+            const resizeObserver = new ResizeObserver((entries) => {
+                for (const entry of entries) sendTableSize(entry.target);
+            });
+            const observeTables = (root) => {
+                const tables = [];
+                if (root instanceof HTMLElement && root.matches(".table-scroll[data-path]")) {
+                    tables.push(root);
+                }
+                if (root instanceof Element || root instanceof Document) {
+                    tables.push(...root.querySelectorAll(".table-scroll[data-path]"));
+                }
+                for (const table of tables) {
+                    if (observedTables.has(table)) continue;
+                    observedTables.add(table);
+                    resizeObserver.observe(table);
+                    sendTableSize(table);
+                }
+            };
+            const unobserveTables = (root) => {
+                const tables = [];
+                if (root instanceof HTMLElement && root.matches(".table-scroll[data-path]")) {
+                    tables.push(root);
+                }
+                if (root instanceof Element) {
+                    tables.push(...root.querySelectorAll(".table-scroll[data-path]"));
+                }
+                for (const table of tables) {
+                    resizeObserver.unobserve(table);
+                    observedTables.delete(table);
+                }
+            };
+            const mutationObserver = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                    for (const node of mutation.addedNodes) observeTables(node);
+                    for (const node of mutation.removedNodes) unobserveTables(node);
+                }
+            });
             window.addEventListener("keydown", handler, true);
             window.addEventListener("keyup", releaseHandler, true);
             window.addEventListener("copy", copyHandler, true);
             window.addEventListener("paste", pasteHandler, true);
             document.addEventListener("selectionchange", cursorHandler, true);
             document.addEventListener("input", cursorHandler, true);
+            observeTables(document);
+            mutationObserver.observe(document.body, {childList: true, subtree: true});
             await new Promise(() => {});
             "#,
         );
@@ -967,6 +1035,7 @@ fn App() -> Element {
                 cell_draft,
                 diagnostic_target,
                 table_analyses,
+                table_viewports,
                 text_cursor,
                 sidebar_visible,
                 overlay_panel,
@@ -980,7 +1049,7 @@ fn App() -> Element {
         .read()
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "No workspace selected".to_owned());
+        .unwrap_or_else(|| tr(Text::NoWorkspace).to_owned());
     let normalized_filter = filter.read().trim().to_lowercase();
     let visible_files = scan
         .read()
@@ -1095,7 +1164,7 @@ fn App() -> Element {
     };
 
     rsx! {
-        document::Title { "Game Config Edit" }
+        document::Title { {tr(Text::AppTitle)} }
         style { {APP_CSS} }
         div {
             class: "app-shell",
@@ -1152,55 +1221,63 @@ fn App() -> Element {
             },
             onmouseup: move |_| resize_drag.set(None),
             header { class: "titlebar",
-                div { class: "brand", "Game Config Edit" }
+                div { class: "brand", {tr(Text::AppTitle)} }
                 div { class: "workspace-path", title: "{root_label}", "{root_label}" }
-                button {
-                    class: "open-button",
-                    title: "Open folder",
-                    onclick: move |_| {
-                        if let Some(path) = choose_workspace() {
-                            if !confirm_close_all_tabs(
-                                tabs,
-                                selected_cell,
-                                cell_draft,
-                                diagnostic_target,
-                                table_analyses,
-                                notice,
-                                "switching workspaces",
-                            ) {
-                                return;
+                div { class: "titlebar-actions",
+                    button {
+                        class: "open-button",
+                        title: tr(Text::Shortcuts),
+                        onclick: move |_| overlay_panel.set(Some(OverlayPanel::Shortcuts)),
+                        {tr(Text::Shortcuts)}
+                    }
+                    button {
+                        class: "open-button",
+                        title: tr(Text::OpenFolder),
+                        onclick: move |_| {
+                            if let Some(path) = choose_workspace() {
+                                if !confirm_close_all_tabs(
+                                    tabs,
+                                    selected_cell,
+                                    cell_draft,
+                                    diagnostic_target,
+                                    table_analyses,
+                                    notice,
+                                    CloseAction::Workspace,
+                                ) {
+                                    return;
+                                }
+                                if let Some(store) = settings_store.as_ref()
+                                    && let Err(error) = store.save_recent_workspace(&path)
+                                {
+                                    scan.write().error = Some(error.to_string());
+                                }
+                                app_settings.write().recent_workspace = Some(path.clone());
+                                preview.set(Preview::Empty);
+                                tabs.set(Vec::new());
+                                active_tab.set(None);
+                                preview_return_tab.set(None);
+                                selected_cell.set(None);
+                                cell_draft.set(None);
+                                diagnostic_target.set(None);
+                                workspace.set(Some(path));
                             }
-                            if let Some(store) = settings_store.as_ref()
-                                && let Err(error) = store.save_recent_workspace(&path)
-                            {
-                                scan.write().error = Some(error.to_string());
-                            }
-                            app_settings.write().recent_workspace = Some(path.clone());
-                            preview.set(Preview::Empty);
-                            tabs.set(Vec::new());
-                            active_tab.set(None);
-                            preview_return_tab.set(None);
-                            selected_cell.set(None);
-                            cell_draft.set(None);
-                            diagnostic_target.set(None);
-                            workspace.set(Some(path));
-                        }
-                    },
-                    "Open folder"
+                        },
+                        {tr(Text::OpenFolder)}
+                    }
                 }
             }
             if let Some(message) = warning.as_deref() {
-                div { class: "banner warning", "{message}" }
+                div { class: "banner warning", {l10n(Message::Technical { prefix: Text::SettingsError, detail: message })} }
             }
             if let Some(message) = scan.read().error.as_deref() {
-                div { class: "banner error", "{message}" }
+                div { class: "banner error", {l10n(Message::Technical { prefix: Text::ScanError, detail: message })} }
             }
             if show_general_notice && let Some(message) = notice.read().as_deref() {
                 div { class: "banner warning", "{message}" }
             }
             if let Some(path) = active_external_conflict {
                 div { class: "banner error conflict-banner",
-                    span { "{file_name(&path)} changed on disk. Local edits were kept." }
+                    span { {l10n(Message::ExternalConflict(&file_name(&path)))} }
                     div { class: "banner-actions",
                         button {
                             onclick: move |_| reload_external_tab(
@@ -1213,7 +1290,7 @@ fn App() -> Element {
                                 external_reload_errors,
                                 notice,
                             ),
-                            "Reload from disk"
+                            {tr(Text::ReloadFromDisk)}
                         }
                         button {
                             onclick: move |_| {
@@ -1221,19 +1298,16 @@ fn App() -> Element {
                                     .as_ref()
                                     .expect("conflict path exists");
                                 external_conflicts.write().remove(path);
-                                notice.set(Some(format!(
-                                    "Kept local edits for {}",
-                                    file_name(path)
-                                )));
+                                notice.set(Some(l10n(Message::KeptLocal(&file_name(path)))));
                             },
-                            "Keep editing"
+                            {tr(Text::KeepEditing)}
                         }
                     }
                 }
             }
             if let Some((path, message)) = active_reload_error {
                 div { class: "banner error conflict-banner",
-                    span { title: "{message}", "Disk version of {file_name(&path)} could not be parsed." }
+                    span { title: "{message}", {l10n(Message::DiskParseFailed(&file_name(&path)))} }
                     div { class: "banner-actions",
                         button {
                             onclick: move |_| reload_external_tab(
@@ -1246,7 +1320,7 @@ fn App() -> Element {
                                 external_reload_errors,
                                 notice,
                             ),
-                            "Retry reload"
+                            {tr(Text::RetryReload)}
                         }
                     }
                 }
@@ -1260,26 +1334,26 @@ fn App() -> Element {
                         input {
                             class: "filter-input",
                             r#type: "search",
-                            placeholder: "Search configurations",
+                            placeholder: tr(Text::SearchConfigurations),
                             value: "{filter}",
                             oninput: move |event| filter.set(event.value()),
                         }
-                        div { class: "sidebar-mode", role: "group", aria_label: "File view",
+                        div { class: "sidebar-mode", role: "group", aria_label: tr(Text::FileView),
                             button {
                                 class: if *sidebar_mode.read() == SidebarMode::List { "mode-button active" } else { "mode-button" },
                                 aria_pressed: if *sidebar_mode.read() == SidebarMode::List { "true" } else { "false" },
                                 onclick: move |_| sidebar_mode.set(SidebarMode::List),
-                                "List"
+                                {tr(Text::List)}
                             }
                             button {
                                 class: if *sidebar_mode.read() == SidebarMode::Tree { "mode-button active" } else { "mode-button" },
                                 aria_pressed: if *sidebar_mode.read() == SidebarMode::Tree { "true" } else { "false" },
                                 onclick: move |_| sidebar_mode.set(SidebarMode::Tree),
-                                "Tree"
+                                {tr(Text::Tree)}
                             }
                         }
                         div { class: "scan-summary",
-                            if scan.read().loading { "Scanning..." } else { "{file_count} CSV files" }
+                            if scan.read().loading { {tr(Text::Scanning)} } else { {count(Count::CsvFiles, file_count)} }
                         }
                     }
                     div { class: "file-list",
@@ -1405,12 +1479,12 @@ fn App() -> Element {
                                                 return;
                                             }
                                             if tabs.read().len() >= 20 {
-                                                notice.set(Some("The 20-tab limit has been reached. Close a tab before opening another file.".to_owned()));
+                                                notice.set(Some(tr(Text::TabLimit).to_owned()));
                                                 return;
                                             }
                                             let file_name = open_file_name.clone();
                                             let preferences = preferences;
-                                            notice.set(Some(format!("Opening {file_name}...")));
+                                            notice.set(Some(l10n(Message::Opening(&file_name))));
                                             spawn(async move {
                                                 let open_path = path.clone();
                                                 let result = tokio::task::spawn_blocking(move || {
@@ -1433,8 +1507,14 @@ fn App() -> Element {
                                                         diagnostic_target.set(None);
                                                         notice.set(None);
                                                     }
-                                                    Ok(Err(error)) => notice.set(Some(error.to_string())),
-                                                    Err(error) => notice.set(Some(error.to_string())),
+                                                    Ok(Err(error)) => notice.set(Some(l10n(Message::Technical {
+                                                        prefix: Text::OpenError,
+                                                        detail: &error.to_string(),
+                                                    }))),
+                                                    Err(error) => notice.set(Some(l10n(Message::Technical {
+                                                        prefix: Text::OpenError,
+                                                        detail: &error.to_string(),
+                                                    }))),
                                                 }
                                             });
                                         },
@@ -1450,7 +1530,7 @@ fn App() -> Element {
                                                         format!("{data_rows} × {columns}")
                                                     }
                                                     Some(CsvFileStats::Error { .. }) => {
-                                                        "Parse error".to_owned()
+                                                        tr(Text::ParseError).to_owned()
                                                     }
                                                 }
                                             }
@@ -1470,7 +1550,7 @@ fn App() -> Element {
                 if *sidebar_visible.read() {
                     div {
                         class: "sidebar-resizer",
-                        title: "Resize sidebar",
+                        title: tr(Text::ResizeSidebar),
                         onmousedown: move |event| {
                             event.prevent_default();
                             resize_drag.set(Some(ResizeDrag::Sidebar {
@@ -1508,7 +1588,7 @@ fn App() -> Element {
                                             }
                                             button {
                                                 class: "tab-close",
-                                                title: "Close tab",
+                                                title: tr(Text::CloseTab),
                                                 onclick: move |_| {
                                                     request_close_tab(
                                                         close_path.clone(),
@@ -1568,26 +1648,26 @@ fn App() -> Element {
                 }
             }
             footer { class: "statusbar",
-                span { "{file_count} files" }
+                span { {count(Count::Files, file_count)} }
                 if warning_count > 0 {
-                    span { class: "status-warning", "{warning_count} scan warnings" }
+                    span { class: "status-warning", {count(Count::ScanWarnings, warning_count)} }
                 }
                 if let Some(status) = current_status {
                     span { "{status.file_name}" }
                     span { "{status.dimensions}" }
                     if status.delimiter_defaulted {
-                        span { class: "status-warning", "Delimiter defaulted to comma" }
+                        span { class: "status-warning", {tr(Text::DelimiterDefaulted)} }
                     }
                     if let Some(parse_errors) = status.parse_errors {
-                        span { class: "status-error", "{parse_errors} CSV errors" }
+                        span { class: "status-error", {count(Count::CsvErrors, parse_errors)} }
                     } else if status.analysis_loading {
-                        span { "Analyzing" }
+                        span { {tr(Text::Analyzing)} }
                     } else {
                         if let Some(red_cells) = status.red_cells {
-                            span { class: if red_cells > 0 { "status-error" } else { "" }, "{red_cells} red cells" }
+                            span { class: if red_cells > 0 { "status-error" } else { "" }, {count(Count::RedCells, red_cells)} }
                         }
                         if let Some(yellow_columns) = status.yellow_columns {
-                            span { class: if yellow_columns > 0 { "status-warning" } else { "" }, "{yellow_columns} yellow columns" }
+                            span { class: if yellow_columns > 0 { "status-warning" } else { "" }, {count(Count::YellowColumns, yellow_columns)} }
                         }
                     }
                     span { class: "status-spacer" }
@@ -1613,6 +1693,47 @@ fn render_overlay_panel(panel: OverlayPanel, context: OverlayContext) -> Element
         OverlayPanel::GoToLine => render_go_to_line(context),
         OverlayPanel::CurrentSearch => render_current_search(context),
         OverlayPanel::GlobalSearch => render_global_search(context),
+        OverlayPanel::Shortcuts => render_shortcuts(context),
+    }
+}
+
+fn render_shortcuts(mut context: OverlayContext) -> Element {
+    let macos = cfg!(target_os = "macos");
+    rsx! {
+        div { class: "overlay-backdrop",
+            section { class: "overlay-panel shortcuts-panel", role: "dialog", aria_label: tr(Text::Shortcuts),
+                header { class: "shortcuts-header",
+                    h1 { {tr(Text::Shortcuts)} }
+                    button {
+                        class: "panel-close-button",
+                        title: tr(Text::Close),
+                        aria_label: tr(Text::Close),
+                        onclick: move |_| context.panel.set(None),
+                        "×"
+                    }
+                }
+                div { class: "shortcuts-content",
+                    for group in [
+                        ShortcutGroup::Global,
+                        ShortcutGroup::FileSearch,
+                        ShortcutGroup::TableNavigation,
+                        ShortcutGroup::Editing,
+                    ] {
+                        section { class: "shortcut-group", key: "{group:?}",
+                            h2 { {group.title()} }
+                            dl {
+                                for entry in SHORTCUTS.iter().filter(|entry| entry.group == group) {
+                                    div { class: "shortcut-row", key: "{entry.keys}",
+                                        dt { "{shortcut_keys(entry.keys, macos)}" }
+                                        dd { {tr(entry.description)} }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1631,12 +1752,12 @@ fn render_command_palette(context: OverlayContext) -> Element {
 
     rsx! {
         div { class: "overlay-backdrop",
-            section { class: "overlay-panel command-panel", role: "dialog", aria_label: "Command palette",
+            section { class: "overlay-panel command-panel", role: "dialog", aria_label: tr(Text::CommandPalette),
                 input {
                     class: "overlay-search-input",
                     r#type: "search",
-                    aria_label: "Search files or enter a line",
-                    placeholder: "Search files",
+                    aria_label: tr(Text::SearchFilesOrLine),
+                    placeholder: tr(Text::SearchFiles),
                     autofocus: true,
                     value: "{state.query}",
                     onmounted: move |event| async move {
@@ -1728,13 +1849,13 @@ fn render_go_to_line(context: OverlayContext) -> Element {
     let mut jump_context = context.clone();
     rsx! {
         div { class: "overlay-backdrop",
-            section { class: "overlay-panel line-panel", role: "dialog", aria_label: "Go to line",
+            section { class: "overlay-panel line-panel", role: "dialog", aria_label: tr(Text::GoToLine),
                 input {
                     class: "overlay-search-input",
                     r#type: "number",
                     min: "1",
-                    aria_label: "Line number",
-                    placeholder: "Line number",
+                    aria_label: tr(Text::LineNumber),
+                    placeholder: tr(Text::LineNumber),
                     autofocus: true,
                     value: "{value}",
                     onmounted: move |event| async move {
@@ -1757,7 +1878,7 @@ fn render_go_to_line(context: OverlayContext) -> Element {
                                 }
                                 Ok(_) => {}
                                 Err(_) => {
-                                    jump_context.notice.set(Some("Enter a positive line number".to_owned()));
+                                    jump_context.notice.set(Some(tr(Text::PositiveLineNumber).to_owned()));
                                 }
                             }
                         }
@@ -1786,12 +1907,12 @@ fn render_current_search(context: OverlayContext) -> Element {
 
     rsx! {
         div { class: "overlay-backdrop overlay-top",
-            section { class: "overlay-panel current-search-panel", role: "dialog", aria_label: "Search current file",
+            section { class: "overlay-panel current-search-panel", role: "dialog", aria_label: tr(Text::SearchCurrentFile),
                 input {
                     class: "overlay-search-input",
                     r#type: "search",
-                    aria_label: "Search current file",
-                    placeholder: "Find",
+                    aria_label: tr(Text::SearchCurrentFile),
+                    placeholder: tr(Text::Find),
                     autofocus: true,
                     value: "{state.query}",
                     onmounted: move |event| async move {
@@ -1819,9 +1940,10 @@ fn render_current_search(context: OverlayContext) -> Element {
                         _ => event.stop_propagation(),
                     },
                 }
-                label { class: "case-toggle",
+                label { class: "case-toggle", title: tr(Text::MatchCase),
                     input {
                         r#type: "checkbox",
+                        aria_label: tr(Text::MatchCase),
                         checked: state.case_sensitive,
                         onchange: move |event| {
                             let mut state = case_context.current_search.write();
@@ -1834,19 +1956,22 @@ fn render_current_search(context: OverlayContext) -> Element {
                 span { class: "search-counter", "{counter}" }
                 button {
                     class: "panel-tool-button",
-                    title: "Previous match",
+                    title: tr(Text::PreviousMatch),
+                    aria_label: tr(Text::PreviousMatch),
                     onclick: move |_| navigate_current_search(previous_context.clone(), -1),
-                    "Prev"
+                    "‹"
                 }
                 button {
                     class: "panel-tool-button",
-                    title: "Next match",
+                    title: tr(Text::NextMatch),
+                    aria_label: tr(Text::NextMatch),
                     onclick: move |_| navigate_current_search(next_context.clone(), 1),
-                    "Next"
+                    "›"
                 }
                 button {
                     class: "panel-close-button",
-                    title: "Close search",
+                    title: tr(Text::CloseSearch),
+                    aria_label: tr(Text::CloseSearch),
                     onclick: move |_| close_panel.set(None),
                     "×"
                 }
@@ -1863,23 +1988,17 @@ fn render_global_search(mut context: OverlayContext) -> Element {
     let case_context = context.clone();
     let close_cancel = context.global_search_cancel;
     let result_count = state.results.len();
-    let summary = if state.loading {
-        format!("Searching · {result_count}")
-    } else if state.truncated {
-        format!("{result_count}+ matches")
-    } else {
-        format!("{result_count} matches")
-    };
+    let summary = search_summary(state.loading, state.truncated, result_count);
 
     rsx! {
         div { class: "overlay-backdrop",
-            section { class: "overlay-panel global-search-panel", role: "dialog", aria_label: "Search workspace",
+            section { class: "overlay-panel global-search-panel", role: "dialog", aria_label: tr(Text::SearchWorkspace),
                 div { class: "global-search-header",
                     input {
                         class: "overlay-search-input",
                         r#type: "search",
-                        aria_label: "Search workspace contents",
-                        placeholder: "Search workspace",
+                        aria_label: tr(Text::SearchWorkspaceContents),
+                        placeholder: tr(Text::SearchWorkspace),
                         autofocus: true,
                         value: "{state.query}",
                         onmounted: move |event| async move {
@@ -1905,9 +2024,10 @@ fn render_global_search(mut context: OverlayContext) -> Element {
                             }
                         },
                     }
-                    label { class: "case-toggle",
+                    label { class: "case-toggle", title: tr(Text::MatchCase),
                         input {
                             r#type: "checkbox",
+                            aria_label: tr(Text::MatchCase),
                             checked: state.case_sensitive,
                             onchange: move |event| {
                                 start_global_search(
@@ -1929,12 +2049,13 @@ fn render_global_search(mut context: OverlayContext) -> Element {
                                 }
                                 context.global_search.write().loading = false;
                             },
-                            "Cancel"
+                            {tr(Text::Stop)}
                         }
                     }
                     button {
                         class: "panel-close-button",
-                        title: "Close search",
+                        title: tr(Text::CloseSearch),
+                        aria_label: tr(Text::CloseSearch),
                         onclick: move |_| {
                             if let Some(cancel) = cancel_signal.read().as_ref() {
                                 cancel.store(true, Ordering::Relaxed);
@@ -1945,7 +2066,7 @@ fn render_global_search(mut context: OverlayContext) -> Element {
                     }
                 }
                 if state.warning_count > 0 {
-                    div { class: "search-warning", "{state.warning_count} files could not be searched" }
+                    div { class: "search-warning", {unsearchable_files(state.warning_count)} }
                 }
                 div { class: "overlay-results global-results",
                     for result in state.results {
@@ -2011,7 +2132,7 @@ fn execute_command_palette(mut context: OverlayContext, results: &[CsvFileEntry]
             Ok(_) => {}
             Err(_) => context
                 .notice
-                .set(Some("Enter a positive line number after ':'".to_owned())),
+                .set(Some(tr(Text::PositiveLineAfterColon).to_owned())),
         }
         return;
     }
@@ -2052,10 +2173,7 @@ fn open_csv_tab(entry: CsvFileEntry, text_line: Option<usize>, mut context: Over
     }
 
     if context.tabs.read().len() >= 20 {
-        context.notice.set(Some(
-            "The 20-tab limit has been reached. Close a tab before opening another file."
-                .to_owned(),
-        ));
+        context.notice.set(Some(tr(Text::TabLimit).to_owned()));
         return;
     }
     let preferences = context
@@ -2070,7 +2188,7 @@ fn open_csv_tab(entry: CsvFileEntry, text_line: Option<usize>, mut context: Over
         .unwrap_or_default();
     context
         .notice
-        .set(Some(format!("Opening {}...", entry.file_name)));
+        .set(Some(l10n(Message::Opening(&entry.file_name))));
     context.panel.set(None);
     spawn(async move {
         let open_path = path.clone();
@@ -2108,8 +2226,14 @@ fn open_csv_tab(entry: CsvFileEntry, text_line: Option<usize>, mut context: Over
                     schedule_text_line_jump(path, text, line);
                 }
             }
-            Ok(Err(error)) => context.notice.set(Some(error.to_string())),
-            Err(error) => context.notice.set(Some(error.to_string())),
+            Ok(Err(error)) => context.notice.set(Some(l10n(Message::Technical {
+                prefix: Text::OpenError,
+                detail: &error.to_string(),
+            }))),
+            Err(error) => context.notice.set(Some(l10n(Message::Technical {
+                prefix: Text::OpenError,
+                detail: &error.to_string(),
+            }))),
         }
     });
 }
@@ -2165,12 +2289,12 @@ fn navigate_current_search(mut context: OverlayContext, direction: isize) {
     let Some(matches) = collect_current_matches(&context, &state) else {
         context
             .notice
-            .set(Some("No searchable file is open".to_owned()));
+            .set(Some(tr(Text::NoSearchableFile).to_owned()));
         return;
     };
     let match_count = matches.len();
     if match_count == 0 {
-        context.notice.set(Some("No matches".to_owned()));
+        context.notice.set(Some(tr(Text::NoMatches).to_owned()));
         return;
     }
     let next_index = match (state.active_index, direction.is_negative()) {
@@ -2207,16 +2331,17 @@ fn navigate_current_search(mut context: OverlayContext, direction: isize) {
             select_text_match(&path, &matches[next_index]);
         }
     }
-    context
-        .notice
-        .set(Some(format!("Match {} of {match_count}", next_index + 1)));
+    context.notice.set(Some(l10n(Message::MatchPosition {
+        current: next_index + 1,
+        total: match_count,
+    })));
 }
 
 fn jump_to_line(line: usize, mut context: OverlayContext) -> bool {
     if line == 0 {
         context
             .notice
-            .set(Some("Line numbers start at 1".to_owned()));
+            .set(Some(tr(Text::LineStartsAtOne).to_owned()));
         return false;
     }
     if let Some(path) = context.active_tab.read().clone() {
@@ -2227,22 +2352,26 @@ fn jump_to_line(line: usize, mut context: OverlayContext) -> bool {
         if tab.view() == DocumentView::Text {
             let line_count = physical_line_count(tab.text());
             if line > line_count {
-                context.notice.set(Some(format!(
-                    "Line {line} is outside this file ({line_count} physical lines)"
-                )));
+                context.notice.set(Some(l10n(Message::LineOutOfFile {
+                    line,
+                    lines: line_count,
+                })));
                 return false;
             }
             let text = tab.text().to_owned();
             drop(tabs);
             schedule_text_line_jump(path, text, line);
-            context.notice.set(Some(format!("Ln {line}")));
+            context
+                .notice
+                .set(Some(l10n(Message::TextPosition { line, column: 1 })));
             return true;
         }
         let data_rows = tab.document.records.len().saturating_sub(tab.header_rows);
         if line > data_rows {
-            context.notice.set(Some(format!(
-                "Row {line} is outside this table ({data_rows} data rows)"
-            )));
+            context.notice.set(Some(l10n(Message::RowOutOfTable {
+                row: line,
+                rows: data_rows,
+            })));
             return false;
         }
         let row_index = tab.header_rows + line - 1;
@@ -2250,7 +2379,7 @@ fn jump_to_line(line: usize, mut context: OverlayContext) -> bool {
         if column_count == 0 {
             context
                 .notice
-                .set(Some("This table has no columns".to_owned()));
+                .set(Some(tr(Text::TableNoColumns).to_owned()));
             return false;
         }
         let column_index = context
@@ -2275,7 +2404,10 @@ fn jump_to_line(line: usize, mut context: OverlayContext) -> bool {
             }),
             header_rows,
         );
-        context.notice.set(Some(format!("Row {line}")));
+        context.notice.set(Some(l10n(Message::TablePosition {
+            row: line,
+            column: 1,
+        })));
         return true;
     }
 
@@ -2287,9 +2419,10 @@ fn jump_to_line(line: usize, mut context: OverlayContext) -> bool {
         let data_rows = document.records.len().saturating_sub(*header_rows);
         let column_count = document.records.first().map_or(0, Vec::len);
         if line == 0 || line > data_rows || column_count == 0 {
-            context.notice.set(Some(format!(
-                "Row {line} is outside this preview ({data_rows} data rows)"
-            )));
+            context.notice.set(Some(l10n(Message::RowOutOfPreview {
+                row: line,
+                rows: data_rows,
+            })));
             return false;
         }
         let row_index = *header_rows + line - 1;
@@ -2305,10 +2438,15 @@ fn jump_to_line(line: usize, mut context: OverlayContext) -> bool {
             }),
             *header_rows,
         );
-        context.notice.set(Some(format!("Row {line}")));
+        context.notice.set(Some(l10n(Message::TablePosition {
+            row: line,
+            column: 1,
+        })));
         return true;
     }
-    context.notice.set(Some("No file is open".to_owned()));
+    context
+        .notice
+        .set(Some(tr(Text::NoSearchableFile).to_owned()));
     false
 }
 
@@ -2437,14 +2575,14 @@ fn render_preview(
     match preview {
         Preview::Empty => rsx! {
             div { class: "empty-editor",
-                h1 { "Select a CSV file" }
-                p { "Choose a file from the workspace to open a read-only preview." }
+                h1 { {tr(Text::EmptyPreviewTitle)} }
+                p { {tr(Text::EmptyPreviewBody)} }
             }
         },
         Preview::Loading { file_name, .. } => rsx! {
             div { class: "empty-editor",
                 h1 { "{file_name}" }
-                p { "Loading CSV preview..." }
+                p { {tr(Text::LoadingPreview)} }
             }
         },
         Preview::Error {
@@ -2452,7 +2590,7 @@ fn render_preview(
         } => rsx! {
             div { class: "preview-error",
                 h1 { "{file_name}" }
-                p { "{message}" }
+                p { strong { {tr(Text::PreviewFailed)} ": " } "{message}" }
             }
         },
         Preview::Document {
@@ -2502,7 +2640,7 @@ fn render_csv_document(
     let title = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("CSV preview")
+        .unwrap_or_else(|| tr(Text::ReadOnlyPreview))
         .to_owned();
     let delimiter = CsvDelimiter::from_byte(document.delimiter).unwrap_or(CsvDelimiter::Comma);
     let text_view = !read_only && view == DocumentView::Text;
@@ -2521,32 +2659,28 @@ fn render_csv_document(
         0
     };
     let summary = if text_view {
-        format!("{line_count} physical lines")
+        physical_lines(line_count)
     } else {
         document
             .dimensions(header_rows)
-            .map(|(rows, columns)| format!("{rows} records · {columns} columns"))
-            .unwrap_or_else(|| format!("Header configuration requires {header_rows} records"))
+            .map(|(rows, columns)| records_columns(rows, columns))
+            .unwrap_or_else(|| header_requirement(header_rows))
     };
     let mode_label = if read_only {
-        "Read-only preview"
+        tr(Text::ReadOnlyPreview)
     } else if text_view {
-        "Editable text"
+        tr(Text::EditableText)
     } else {
-        "Editable table"
+        tr(Text::EditableTable)
     };
     let save_path = path.clone();
     let data_row_count = document.records.len().saturating_sub(header_rows);
     let data_column_count = document.records.first().map_or(0, Vec::len);
-    let focused_index = if read_only {
-        None
-    } else {
-        focused_column
-            .read()
-            .as_ref()
-            .filter(|focused| focused.path == path && focused.column_index < data_column_count)
-            .map(|focused| focused.column_index)
-    };
+    let focused_index = focused_column
+        .read()
+        .as_ref()
+        .filter(|focused| focused.path == path && focused.column_index < data_column_count)
+        .map(|focused| focused.column_index);
     let row_height = if focused_index.is_some() {
         FOCUS_DATA_ROW_HEIGHT
     } else {
@@ -2570,7 +2704,7 @@ fn render_csv_document(
     } else {
         "csv-table"
     };
-    let focus_width = focused_index
+    let requested_focus_width = focused_index
         .and_then(|column_index| {
             analyses
                 .as_deref()
@@ -2578,6 +2712,17 @@ fn render_csv_document(
         })
         .map(|analysis| focus_column_width(analysis.max_content_chars))
         .unwrap_or(320);
+    let focus_layout = focused_index.and_then(|column_index| {
+        FocusLayout::calculate(
+            data_column_count,
+            column_index,
+            requested_focus_width,
+            viewport.width,
+        )
+    });
+    let focus_width = focus_layout
+        .as_ref()
+        .map_or(requested_focus_width, |layout| layout.focused_width);
     let configured_column_widths = {
         let widths = column_widths.read();
         (0..data_column_count)
@@ -2589,13 +2734,19 @@ fn render_csv_document(
             })
             .collect::<Vec<_>>()
     };
-    let table_width = if let Some(focused) = focused_index {
-        let neighbor_count =
-            usize::from(focused > 0) + usize::from(focused + 1 < data_column_count);
-        58 + focus_width + neighbor_count * 180
+    let table_width = if let Some(layout) = focus_layout.as_ref() {
+        layout.table_width
     } else {
         58 + configured_column_widths.iter().sum::<usize>()
     };
+    let left_spacer_width = focus_layout
+        .as_ref()
+        .map_or(0, |layout| layout.left_spacer_width);
+    let right_spacer_width = focus_layout
+        .as_ref()
+        .map_or(0, |layout| layout.right_spacer_width);
+    let rendered_column_count =
+        column_count + usize::from(left_spacer_width > 0) + usize::from(right_spacer_width > 0);
     let type_row_top = header_rows * HEADER_ROW_HEIGHT;
     let header_path = path.clone();
     let header_context = preference_context.clone();
@@ -2625,7 +2776,7 @@ fn render_csv_document(
     let table_analyses = preference_context.table_analyses;
     let reveal_path = path.clone();
     let mut reveal_notice = notice;
-    let reveal_button_label = reveal_label();
+    let reveal_button_label = tr(Text::RevealInFileManager);
 
     rsx! {
         div { class: "preview-header",
@@ -2635,7 +2786,7 @@ fn render_csv_document(
             }
             div { class: "preview-actions",
                 if !read_only {
-                    div { class: "view-switch", role: "group", aria_label: "Editor view",
+                    div { class: "view-switch", role: "group", aria_label: tr(Text::EditorView),
                         button {
                             class: if view == DocumentView::Table { "active" } else { "" },
                             aria_pressed: if view == DocumentView::Table { "true" } else { "false" },
@@ -2651,7 +2802,7 @@ fn render_csv_document(
                                 table_view_context.clone(),
                                 notice,
                             ),
-                            "Table"
+                            {tr(Text::Table)}
                         }
                         button {
                             class: if view == DocumentView::Text { "active" } else { "" },
@@ -2668,15 +2819,15 @@ fn render_csv_document(
                                 preference_context.clone(),
                                 notice,
                             ),
-                            "Text"
+                            {tr(Text::Text)}
                         }
                     }
                 }
                 if !text_view {
                     label { class: "document-setting",
-                    span { "Headers" }
+                    span { {tr(Text::HeaderRows)} }
                     select {
-                        aria_label: "Header rows",
+                        aria_label: tr(Text::HeaderRows),
                         value: "{header_rows}",
                         onchange: move |event| {
                             if let Ok(rows) = event.value().parse::<usize>() {
@@ -2704,9 +2855,9 @@ fn render_csv_document(
                     }
                 }
                     label { class: "document-setting",
-                    span { "Delimiter" }
+                    span { {tr(Text::Delimiter)} }
                     select {
-                        aria_label: "CSV delimiter",
+                        aria_label: tr(Text::CsvDelimiter),
                         value: "{delimiter.setting_value()}",
                         onchange: move |event| {
                             if let Some(delimiter) = CsvDelimiter::from_setting_value(&event.value()) {
@@ -2728,7 +2879,7 @@ fn render_csv_document(
                             option {
                                 value: "{option_delimiter.setting_value()}",
                                 selected: option_delimiter == delimiter,
-                                "{option_delimiter.label()}"
+                                {localized_delimiter_label(option_delimiter)}
                             }
                         }
                     }
@@ -2738,21 +2889,20 @@ fn render_csv_document(
                     class: "reveal-button",
                     title: "{reveal_button_label}",
                     onclick: move |_| match reveal_in_file_manager(&reveal_path) {
-                        Ok(()) => reveal_notice.set(Some(format!(
-                            "Opened {} in the system file manager",
-                            file_name(&reveal_path)
-                        ))),
-                        Err(error) => reveal_notice.set(Some(format!(
-                            "Could not show {} in the system file manager: {error}",
-                            file_name(&reveal_path)
-                        ))),
+                        Ok(()) => reveal_notice.set(Some(l10n(Message::Revealed(
+                            &file_name(&reveal_path),
+                        )))),
+                        Err(error) => reveal_notice.set(Some(l10n(Message::RevealFailed {
+                            file: &file_name(&reveal_path),
+                            detail: &error.to_string(),
+                        }))),
                     },
                     "{reveal_button_label}"
                 }
                 if !read_only {
                     button {
                         class: "save-button",
-                        title: "Save file",
+                        title: tr(Text::SaveFile),
                         onclick: move |_| {
                             attempt_save_tab(
                                 &save_path,
@@ -2764,7 +2914,7 @@ fn render_csv_document(
                                 notice,
                             );
                         },
-                        "Save"
+                        {tr(Text::Save)}
                     }
                 }
             }
@@ -2773,7 +2923,7 @@ fn render_csv_document(
             div { class: "text-view",
                 if let Some(issue) = parse_issue {
                     div { class: "text-parse-error", title: "{issue.message}",
-                        strong { "CSV parse failed ({issue.count})" }
+                        strong { {csv_parse_failed(issue.count)} }
                         span { "{issue.message}" }
                     }
                 }
@@ -2788,7 +2938,7 @@ fn render_csv_document(
                         id: "{editor_id}",
                         class: "text-editor-input",
                         "data-path": "{path.to_string_lossy()}",
-                        aria_label: "CSV text editor",
+                        aria_label: tr(Text::CsvTextEditor),
                         spellcheck: "false",
                         wrap: "off",
                         value: "{text_value}",
@@ -2812,34 +2962,36 @@ fn render_csv_document(
             }
         } else if document.records.len() < header_rows {
             div { class: "preview-error",
-                h1 { "Invalid header configuration" }
-                p { "This file has fewer than the configured {header_rows} header records." }
+                h1 { {tr(Text::InvalidHeaderTitle)} }
+                p { {tr(Text::InvalidHeaderBody)} " ({header_rows})" }
             }
         } else {
             div {
                 class: "table-scroll",
                 tabindex: "0",
+                "data-path": "{path.to_string_lossy()}",
                 "data-row-height": "{row_height}",
                 onkeydown: move |event| handle_table_mode_keydown(
                     event,
                     &table_mode_path,
-                    read_only,
-                    tabs,
+                    data_column_count,
+                    header_rows,
                     selected_cell,
                     cell_draft,
                     focused_column,
                     diagnostic_target,
                 ),
                 onscroll: move |event| {
-                    let next = TableViewport {
-                        scroll_top: event.data().scroll_top(),
-                        height: f64::from(event.data().client_height()),
-                    };
                     let current = table_viewports
                         .read()
                         .get(&scroll_path)
                         .copied()
                         .unwrap_or_default();
+                    let next = TableViewport {
+                        scroll_top: event.data().scroll_top(),
+                        height: f64::from(event.data().client_height()),
+                        width: current.width,
+                    };
                     if visible_row_range_with_height(data_row_count, current, row_height)
                         != visible_row_range_with_height(data_row_count, next, row_height)
                     {
@@ -2851,16 +3003,19 @@ fn render_csv_document(
                     style: "--focus-column-width: {focus_width}px; width: {table_width}px",
                     colgroup {
                         col { class: "row-number-column" }
+                        if left_spacer_width > 0 {
+                            col {
+                                class: "focus-side-spacer",
+                                style: "width: {left_spacer_width}px",
+                            }
+                        }
                         for (column_index, configured_width) in configured_column_widths.iter().copied().enumerate() {
                             {
-                                let focus_class = column_focus_class(column_index, focused_index);
-                                let width = if focused_index == Some(column_index) {
-                                    focus_width
-                                } else if focused_index.is_some() {
-                                    180
-                                } else {
-                                    configured_width
-                                };
+                                let focus_class = column_focus_class(column_index, focus_layout.as_ref());
+                                let width = focus_layout
+                                    .as_ref()
+                                    .and_then(|layout| layout.column_width(column_index))
+                                    .unwrap_or(configured_width);
                                 rsx! {
                                     col {
                                         class: "{focus_class}",
@@ -2868,6 +3023,12 @@ fn render_csv_document(
                                         style: "width: {width}px",
                                     }
                                 }
+                            }
+                        }
+                        if right_spacer_width > 0 {
+                            col {
+                                class: "focus-side-spacer",
+                                style: "width: {right_spacer_width}px",
                             }
                         }
                     }
@@ -2881,12 +3042,15 @@ fn render_csv_document(
                                         key: "header-{header_index}",
                                         style: "--header-top: {header_top}px",
                                         th { class: "row-number", "" }
+                                        if left_spacer_width > 0 {
+                                            th { class: "focus-side-spacer", "" }
+                                        }
                                         for (column_index, value) in record.iter().enumerate() {
                                             {
                                                 let column_class = with_column_focus_class(
                                                     "",
                                                     column_index,
-                                                    focused_index,
+                                                    focus_layout.as_ref(),
                                                 );
                                                 let resize_path = path.clone();
                                                 let configured_width = configured_column_widths
@@ -2905,8 +3069,8 @@ fn render_csv_document(
                                                         {
                                                             button {
                                                                 class: "column-resizer",
-                                                                aria_label: "Resize column {column_index}",
-                                                                title: "Resize column",
+                                                                aria_label: format!("{} {column_index}", tr(Text::ResizeColumn)),
+                                                                title: tr(Text::ResizeColumn),
                                                                 onmousedown: move |event| {
                                                                     event.prevent_default();
                                                                     event.stop_propagation();
@@ -2923,12 +3087,18 @@ fn render_csv_document(
                                                 }
                                             }
                                         }
+                                        if right_spacer_width > 0 {
+                                            th { class: "focus-side-spacer", "" }
+                                        }
                                     }
                                 }
                             }
                         }
                         tr { class: "type-row", style: "--type-top: {type_row_top}px",
-                            th { class: "row-number", "type" }
+                            th { class: "row-number", {tr(Text::TypeLabel)} }
+                            if left_spacer_width > 0 {
+                                th { class: "focus-side-spacer", "" }
+                            }
                             if let Some(analyses) = analyses.as_deref() {
                                 for (column_index, analysis) in analyses.iter().enumerate() {
                                     {
@@ -2954,7 +3124,7 @@ fn render_csv_document(
                                         let class = with_column_focus_class(
                                             diagnostic_class,
                                             column_index,
-                                            focused_index,
+                                            focus_layout.as_ref(),
                                         );
                                         let first_problem_row = analysis.problems.first().map(|problem| problem.row_index);
                                         let type_path = path.clone();
@@ -2992,11 +3162,14 @@ fn render_csv_document(
                             } else {
                                 for column_index in 0..data_column_count {
                                     th {
-                                        class: with_column_focus_class("type-loading", column_index, focused_index),
+                                        class: with_column_focus_class("type-loading", column_index, focus_layout.as_ref()),
                                         key: "loading-{column_index}",
-                                        "analyzing"
+                                        {tr(Text::Analyzing)}
                                     }
                                 }
+                            }
+                            if right_spacer_width > 0 {
+                                th { class: "focus-side-spacer", "" }
                             }
                         }
                     }
@@ -3004,7 +3177,7 @@ fn render_csv_document(
                         if top_spacer_height > 0.0 {
                             tr { class: "virtual-spacer",
                                 td {
-                                    colspan: "{column_count}",
+                                    colspan: "{rendered_column_count}",
                                     style: "height: {top_spacer_height}px",
                                 }
                             }
@@ -3012,6 +3185,9 @@ fn render_csv_document(
                         for (source_row_index, record) in document.records.iter().enumerate().skip(visible_start).take(visible_count) {
                             tr { key: "{source_row_index}",
                                 th { class: "row-number", "{source_row_index - header_rows + 1}" }
+                                if left_spacer_width > 0 {
+                                    td { class: "focus-side-spacer", "" }
+                                }
                                 for (column_index, value) in record.iter().enumerate() {
                                     {
                                         let location = CellLocation {
@@ -3026,11 +3202,15 @@ fn render_csv_document(
                                                 analysis.problems.iter().any(|problem| problem.row_index == source_row_index)
                                             });
                                         let is_selected = selected_cell.read().as_ref() == Some(&location);
-                                        let editing_value = cell_draft
-                                            .read()
-                                            .as_ref()
-                                            .filter(|draft| draft.location == location)
-                                            .map(|draft| draft.value.clone());
+                                        let editing_value = if read_only {
+                                            None
+                                        } else {
+                                            cell_draft
+                                                .read()
+                                                .as_ref()
+                                                .filter(|draft| draft.location == location)
+                                                .map(|draft| draft.value.clone())
+                                        };
                                         let is_json_cell = json_structure(value).is_some();
                                         let display_value = editable_cell_value(value);
                                         let highlighted_json = if is_json_cell {
@@ -3047,7 +3227,7 @@ fn render_csv_document(
                                         let class = with_column_focus_class(
                                             cell_state_class,
                                             column_index,
-                                            focused_index,
+                                            focus_layout.as_ref(),
                                         );
                                         let select_location = location.clone();
                                         let input_location = location.clone();
@@ -3060,9 +3240,7 @@ fn render_csv_document(
                                                 id: "cell-{source_row_index}-{column_index}",
                                                 key: "{column_index}",
                                                 title: "{value}",
-                                                if read_only {
-                                                    "{display_value}"
-                                                } else if let Some(editing_value) = editing_value {
+                                                if let Some(editing_value) = editing_value {
                                                     if let Some(highlighted_json) = highlighted_json {
                                                         div { class: "json-editor",
                                                             pre {
@@ -3072,7 +3250,7 @@ fn render_csv_document(
                                                             }
                                                             textarea {
                                                                 class: "cell-input json-input",
-                                                                aria_label: "JSON cell editor",
+                                                                aria_label: tr(Text::JsonCellEditor),
                                                                 autofocus: true,
                                                                 spellcheck: "false",
                                                                 value: "{editing_value}",
@@ -3172,25 +3350,32 @@ fn render_csv_document(
                                                         class: "cell-button",
                                                         "data-cell-value": "{value}",
                                                         onclick: move |_| {
-                                                            if focused_index.is_some_and(|column_index| {
-                                                                column_index != select_location.column_index
-                                                            }) {
-                                                                focused_column.set(Some(FocusedColumn {
-                                                                    path: select_location.path.clone(),
-                                                                    column_index: select_location.column_index,
-                                                                }));
-                                                                selected_cell.set(Some(select_location.clone()));
-                                                                diagnostic_target.set(None);
-                                                                return;
-                                                            }
-                                                            if selected_cell.read().as_ref() == Some(&select_location) {
-                                                                cell_draft.set(Some(CellDraft {
-                                                                    location: select_location.clone(),
-                                                                    value: editable_cell_value(&draft_value),
-                                                                }));
-                                                            } else {
-                                                                selected_cell.set(Some(select_location.clone()));
-                                                                diagnostic_target.set(None);
+                                                            let is_selected = selected_cell.read().as_ref()
+                                                                == Some(&select_location);
+                                                            match cell_click_action(
+                                                                read_only,
+                                                                is_selected,
+                                                                focused_index,
+                                                                select_location.column_index,
+                                                            ) {
+                                                                CellClickAction::Select => {
+                                                                    selected_cell.set(Some(select_location.clone()));
+                                                                    diagnostic_target.set(None);
+                                                                }
+                                                                CellClickAction::SwitchFocus => {
+                                                                    focused_column.set(Some(FocusedColumn {
+                                                                        path: select_location.path.clone(),
+                                                                        column_index: select_location.column_index,
+                                                                    }));
+                                                                    selected_cell.set(Some(select_location.clone()));
+                                                                    diagnostic_target.set(None);
+                                                                }
+                                                                CellClickAction::Edit => {
+                                                                    cell_draft.set(Some(CellDraft {
+                                                                        location: select_location.clone(),
+                                                                        value: editable_cell_value(&draft_value),
+                                                                    }));
+                                                                }
                                                             }
                                                         },
                                                         "{display_value}"
@@ -3200,12 +3385,15 @@ fn render_csv_document(
                                         }
                                     }
                                 }
+                                if right_spacer_width > 0 {
+                                    td { class: "focus-side-spacer", "" }
+                                }
                             }
                         }
                         if bottom_spacer_height > 0.0 {
                             tr { class: "virtual-spacer",
                                 td {
-                                    colspan: "{column_count}",
+                                    colspan: "{rendered_column_count}",
                                     style: "height: {bottom_spacer_height}px",
                                 }
                             }
@@ -3262,12 +3450,12 @@ fn request_document_view(
         .find(|tab| &tab.document.path == path)
         .map(|tab| (tab.text_bytes(), tab.text_hash(), tab.delimiter_override()));
     let Some((bytes, source_hash, delimiter)) = request else {
-        notice.set(Some("Open tab no longer exists".to_owned()));
+        notice.set(Some(tr(Text::OpenTabMissing).to_owned()));
         return;
     };
 
     let parse_path = path.clone();
-    notice.set(Some(format!("Parsing {}...", file_name(path))));
+    notice.set(Some(l10n(Message::Parsing(&file_name(path)))));
     spawn(async move {
         let worker_path = parse_path.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -3283,18 +3471,14 @@ fn request_document_view(
             return;
         };
         if tab.text_hash() != source_hash {
-            notice.set(Some(
-                "Text changed while parsing; switch to Table again".to_owned(),
-            ));
+            notice.set(Some(tr(Text::TextChangedParsing).to_owned()));
             return;
         }
 
         match result {
             Ok(Ok(document)) => {
                 if !tab.show_parsed_table(document) {
-                    notice.set(Some(
-                        "Text changed while parsing; switch to Table again".to_owned(),
-                    ));
+                    notice.set(Some(tr(Text::TextChangedParsing).to_owned()));
                     return;
                 }
                 let stats = stats_for_document(&tab.document, tab.header_rows);
@@ -3304,11 +3488,17 @@ fn request_document_view(
             Ok(Err(error)) => {
                 let count = error.parse_error_count().unwrap_or(1);
                 tab.reject_parsed_text(error.to_string(), count);
-                notice.set(Some(error.to_string()));
+                notice.set(Some(l10n(Message::Technical {
+                    prefix: Text::OpenError,
+                    detail: &error.to_string(),
+                })));
             }
             Err(error) => {
                 tab.reject_parsed_text(error.to_string(), 1);
-                notice.set(Some(error.to_string()));
+                notice.set(Some(l10n(Message::Technical {
+                    prefix: Text::OpenError,
+                    detail: &error.to_string(),
+                })));
             }
         }
     });
@@ -3361,9 +3551,10 @@ fn change_header_rows(
     mut notice: Signal<Option<String>>,
 ) {
     if !(MIN_HEADER_ROWS..=MAX_HEADER_ROWS).contains(&header_rows) {
-        notice.set(Some(format!(
-            "Header rows must be between {MIN_HEADER_ROWS} and {MAX_HEADER_ROWS}"
-        )));
+        notice.set(Some(l10n(Message::HeaderRange {
+            minimum: MIN_HEADER_ROWS,
+            maximum: MAX_HEADER_ROWS,
+        })));
         return;
     }
     if !read_only
@@ -3387,7 +3578,7 @@ fn change_header_rows(
                 *current_header_rows = header_rows;
                 Ok(stats_for_document(document, header_rows))
             }
-            _ => Err("CSV preview is no longer open".to_owned()),
+            _ => Err(tr(Text::PreviewClosed).to_owned()),
         }
     } else {
         let mut tabs_write = tabs.write();
@@ -3396,7 +3587,7 @@ fn change_header_rows(
                 .set_header_rows(header_rows)
                 .map(|()| stats_for_document(&tab.document, header_rows))
                 .map_err(|error| error.to_string()),
-            None => Err("Open tab no longer exists".to_owned()),
+            None => Err(tr(Text::OpenTabMissing).to_owned()),
         }
     };
 
@@ -3413,7 +3604,10 @@ fn change_header_rows(
             preferences.header_rows = header_rows;
             persist_file_preferences(&context, path, preferences, notice);
         }
-        Err(error) => notice.set(Some(error)),
+        Err(error) => notice.set(Some(l10n(Message::Technical {
+            prefix: Text::SettingsError,
+            detail: &error,
+        }))),
     }
 }
 
@@ -3456,7 +3650,7 @@ fn change_delimiter(
                     })
                     .map_err(|error| error.to_string())
             }
-            _ => Err("CSV preview is no longer open".to_owned()),
+            _ => Err(tr(Text::PreviewClosed).to_owned()),
         }
     } else {
         let mut tabs_write = tabs.write();
@@ -3470,7 +3664,7 @@ fn change_delimiter(
                     )
                 })
                 .map_err(|error| error.to_string()),
-            None => Err("Open tab no longer exists".to_owned()),
+            None => Err(tr(Text::OpenTabMissing).to_owned()),
         }
     };
 
@@ -3488,7 +3682,10 @@ fn change_delimiter(
             preferences.delimiter = Some(delimiter);
             persist_file_preferences(&context, path, preferences, notice);
         }
-        Err(error) => notice.set(Some(error)),
+        Err(error) => notice.set(Some(l10n(Message::Technical {
+            prefix: Text::SettingsError,
+            detail: &error,
+        }))),
     }
 }
 
@@ -3496,7 +3693,7 @@ fn stats_for_document(document: &CsvDocument, header_rows: usize) -> CsvFileStat
     match document.dimensions(header_rows) {
         Some((data_rows, columns)) => CsvFileStats::Ready { data_rows, columns },
         None => CsvFileStats::Error {
-            message: format!("file has fewer than the configured {header_rows} header records"),
+            message: l10n(Message::InvalidHeaderRecords(header_rows)),
         },
     }
 }
@@ -3507,11 +3704,11 @@ fn preferences_for_path(
     mut notice: Signal<Option<String>>,
 ) -> Option<FilePreferences> {
     let Some(workspace) = context.workspace.as_deref() else {
-        notice.set(Some("No workspace is open".to_owned()));
+        notice.set(Some(tr(Text::NoWorkspaceOpen).to_owned()));
         return None;
     };
     let Ok(relative_path) = path.strip_prefix(workspace) else {
-        notice.set(Some("CSV file is outside the current workspace".to_owned()));
+        notice.set(Some(tr(Text::OutsideWorkspace).to_owned()));
         return None;
     };
     Some(
@@ -3529,11 +3726,11 @@ fn persist_file_preferences(
     mut notice: Signal<Option<String>>,
 ) {
     let Some(workspace) = context.workspace.as_deref() else {
-        notice.set(Some("No workspace is open".to_owned()));
+        notice.set(Some(tr(Text::NoWorkspaceOpen).to_owned()));
         return;
     };
     let Ok(relative_path) = path.strip_prefix(workspace) else {
-        notice.set(Some("CSV file is outside the current workspace".to_owned()));
+        notice.set(Some(tr(Text::OutsideWorkspace).to_owned()));
         return;
     };
 
@@ -3562,14 +3759,14 @@ fn commit_cell_draft(
         .write()
         .iter_mut()
         .find(|tab| tab.document.path == draft.location.path)
-        .ok_or_else(|| "Open tab no longer exists".to_owned())
+        .ok_or_else(|| tr(Text::OpenTabMissing).to_owned())
         .and_then(|tab| {
             let original = tab
                 .document
                 .records
                 .get(draft.location.row_index)
                 .and_then(|row| row.get(draft.location.column_index))
-                .ok_or_else(|| "Edited cell no longer exists".to_owned())?;
+                .ok_or_else(|| tr(Text::EditedCellMissing).to_owned())?;
             let value = normalize_cell_edit(original, &draft.value)?;
             tab.edit_cell(draft.location.row_index, draft.location.column_index, value)
                 .map_err(|error| error.to_string())
@@ -3581,7 +3778,10 @@ fn commit_cell_draft(
             true
         }
         Err(error) => {
-            notice.set(Some(error));
+            notice.set(Some(l10n(Message::Technical {
+                prefix: Text::SaveError,
+                detail: &error,
+            })));
             false
         }
     }
@@ -3608,7 +3808,7 @@ fn paste_selected_cell(
         .clone()
         .filter(|location| location.path == active_path)
     else {
-        notice.set(Some("Select a table cell before pasting".to_owned()));
+        notice.set(Some(tr(Text::SelectCellBeforePaste).to_owned()));
         return;
     };
 
@@ -3616,7 +3816,7 @@ fn paste_selected_cell(
         .write()
         .iter_mut()
         .find(|tab| tab.document.path == active_path)
-        .ok_or_else(|| "Open tab no longer exists".to_owned())
+        .ok_or_else(|| tr(Text::OpenTabMissing).to_owned())
         .and_then(|tab| {
             tab.edit_cell(location.row_index, location.column_index, value)
                 .map_err(|error| error.to_string())
@@ -3624,10 +3824,13 @@ fn paste_selected_cell(
     match result {
         Ok(true) => {
             diagnostic_target.set(None);
-            notice.set(Some("Pasted cell value".to_owned()));
+            notice.set(Some(tr(Text::PastedCell).to_owned()));
         }
-        Ok(false) => notice.set(Some("Clipboard value matches the selected cell".to_owned())),
-        Err(error) => notice.set(Some(error)),
+        Ok(false) => notice.set(Some(tr(Text::ClipboardSame).to_owned())),
+        Err(error) => notice.set(Some(l10n(Message::Technical {
+            prefix: Text::SaveError,
+            detail: &error,
+        }))),
     }
 }
 
@@ -3677,6 +3880,7 @@ fn handle_window_shortcut(
     mut cell_draft: Signal<Option<CellDraft>>,
     mut diagnostic_target: Signal<Option<DiagnosticTarget>>,
     table_analyses: Signal<HashMap<PathBuf, TableAnalysisState>>,
+    mut table_viewports: Signal<HashMap<PathBuf, TableViewport>>,
     mut text_cursor: Signal<Option<TextCursorPosition>>,
     mut sidebar_visible: Signal<bool>,
     mut overlay_panel: Signal<Option<OverlayPanel>>,
@@ -3695,6 +3899,9 @@ fn handle_window_shortcut(
         }
         WindowShortcutCommand::GlobalSearch => {
             overlay_panel.set(Some(OverlayPanel::GlobalSearch));
+        }
+        WindowShortcutCommand::Shortcuts => {
+            overlay_panel.set(Some(OverlayPanel::Shortcuts));
         }
         WindowShortcutCommand::Save => {
             if let Some(path) = active_tab.read().clone() {
@@ -3767,9 +3974,9 @@ fn handle_window_shortcut(
                         .find(|tab| tab.document.path == location.path)
                         .and_then(|tab| tab.document.records.get(location.row_index))
                         .and_then(|row| row.get(location.column_index))
-                        .map(|_| "Copied cell value")
+                        .map(|_| tr(Text::CopiedCell))
                 })
-                .unwrap_or("Nothing selected to copy");
+                .unwrap_or_else(|| tr(Text::NothingSelectedCopy));
             let mut notice = notice;
             notice.set(Some(value_label.to_owned()));
         }
@@ -3783,6 +3990,16 @@ fn handle_window_shortcut(
             notice,
         ),
         WindowShortcutCommand::TextCursor(position) => text_cursor.set(Some(position)),
+        WindowShortcutCommand::TableViewport(size) => {
+            let mut viewports = table_viewports.write();
+            let viewport = viewports.entry(size.path).or_default();
+            if size.width.is_finite() && size.width > 0.0 {
+                viewport.width = size.width;
+            }
+            if size.height.is_finite() && size.height > 0.0 {
+                viewport.height = size.height;
+            }
+        }
     }
 }
 
@@ -3938,14 +4155,14 @@ fn handle_app_keydown(
 fn handle_table_mode_keydown(
     event: KeyboardEvent,
     path: &PathBuf,
-    read_only: bool,
-    tabs: Signal<Vec<DocumentSession>>,
+    column_count: usize,
+    header_rows: usize,
     selected_cell: Signal<Option<CellLocation>>,
     cell_draft: Signal<Option<CellDraft>>,
     mut focused_column: Signal<Option<FocusedColumn>>,
     diagnostic_target: Signal<Option<DiagnosticTarget>>,
 ) {
-    if read_only || cell_draft.read().is_some() {
+    if cell_draft.read().is_some() {
         return;
     }
     let key = event.key();
@@ -3998,7 +4215,8 @@ fn handle_table_mode_keydown(
         move_focused_column(
             path,
             direction,
-            tabs,
+            column_count,
+            header_rows,
             selected_cell,
             focused_column,
             diagnostic_target,
@@ -4009,16 +4227,12 @@ fn handle_table_mode_keydown(
 fn move_focused_column(
     path: &PathBuf,
     direction: isize,
-    tabs: Signal<Vec<DocumentSession>>,
+    column_count: usize,
+    header_rows: usize,
     mut selected_cell: Signal<Option<CellLocation>>,
     mut focused_column: Signal<Option<FocusedColumn>>,
     mut diagnostic_target: Signal<Option<DiagnosticTarget>>,
 ) {
-    let tabs_read = tabs.read();
-    let Some(session) = tabs_read.iter().find(|tab| &tab.document.path == path) else {
-        return;
-    };
-    let column_count = session.document.records.first().map_or(0, Vec::len);
     if column_count == 0 {
         return;
     }
@@ -4035,17 +4249,13 @@ fn move_focused_column(
                 .map(|location| location.column_index)
         })
         .unwrap_or(0);
-    let next_column = current_column
-        .saturating_add_signed(direction)
-        .min(column_count - 1);
+    let next_column = next_focused_column(current_column, direction, column_count);
     let row_index = selected_cell
         .read()
         .as_ref()
         .filter(|location| &location.path == path)
         .map(|location| location.row_index)
-        .unwrap_or(session.header_rows);
-    let header_rows = session.header_rows;
-    drop(tabs_read);
+        .unwrap_or(header_rows);
 
     focused_column.set(Some(FocusedColumn {
         path: path.clone(),
@@ -4066,11 +4276,44 @@ fn move_focused_column(
     );
 }
 
+fn next_focused_column(current: usize, direction: isize, column_count: usize) -> usize {
+    if column_count == 0 {
+        return 0;
+    }
+    current
+        .saturating_add_signed(direction)
+        .min(column_count - 1)
+}
+
 fn focus_column_width(max_content_chars: usize) -> usize {
     max_content_chars
         .saturating_mul(7)
         .saturating_add(36)
         .clamp(320, 720)
+}
+
+fn cell_click_action(
+    read_only: bool,
+    is_selected: bool,
+    focused_column: Option<usize>,
+    clicked_column: usize,
+) -> CellClickAction {
+    if focused_column.is_some_and(|focused| focused != clicked_column) {
+        CellClickAction::SwitchFocus
+    } else if !read_only && is_selected {
+        CellClickAction::Edit
+    } else {
+        CellClickAction::Select
+    }
+}
+
+fn localized_delimiter_label(delimiter: CsvDelimiter) -> &'static str {
+    tr(match delimiter {
+        CsvDelimiter::Comma => Text::Comma,
+        CsvDelimiter::Tab => Text::Tab,
+        CsvDelimiter::Semicolon => Text::Semicolon,
+        CsvDelimiter::Pipe => Text::Pipe,
+    })
 }
 
 fn resized_dimension(start_width: usize, delta: f64, minimum: usize, maximum: usize) -> usize {
@@ -4080,21 +4323,22 @@ fn resized_dimension(start_width: usize, delta: f64, minimum: usize, maximum: us
         .clamp(minimum as f64, maximum as f64) as usize
 }
 
-fn column_focus_class(column_index: usize, focused_index: Option<usize>) -> &'static str {
-    match focused_index {
+fn column_focus_class(column_index: usize, layout: Option<&FocusLayout>) -> &'static str {
+    match layout.map(|layout| layout.column_role(column_index)) {
         None => "",
-        Some(focused) if focused == column_index => "focus-column",
-        Some(focused) if focused.abs_diff(column_index) == 1 => "focus-neighbor",
-        Some(_) => "column-hidden",
+        Some(FocusColumnRole::LeftNeighbor) => "focus-left-neighbor",
+        Some(FocusColumnRole::Focused) => "focus-column",
+        Some(FocusColumnRole::RightNeighbor) => "focus-right-neighbor",
+        Some(FocusColumnRole::Hidden) => "column-hidden",
     }
 }
 
 fn with_column_focus_class(
     base_class: &str,
     column_index: usize,
-    focused_index: Option<usize>,
+    layout: Option<&FocusLayout>,
 ) -> String {
-    let focus_class = column_focus_class(column_index, focused_index);
+    let focus_class = column_focus_class(column_index, layout);
     match (base_class.is_empty(), focus_class.is_empty()) {
         (true, true) => String::new(),
         (false, true) => base_class.to_owned(),
@@ -4129,8 +4373,12 @@ fn normalize_cell_edit(original: &str, draft: &str) -> Result<String, String> {
     let Some(expected) = json_structure(original) else {
         return Ok(draft.to_owned());
     };
-    let parsed = serde_json::from_str::<serde_json::Value>(draft)
-        .map_err(|error| format!("JSON syntax error: {error}"))?;
+    let parsed = serde_json::from_str::<serde_json::Value>(draft).map_err(|error| {
+        l10n(Message::Technical {
+            prefix: Text::JsonSyntaxError,
+            detail: &error.to_string(),
+        })
+    })?;
     let actual = match &parsed {
         serde_json::Value::Object(_) => Some(JsonStructure::Object),
         serde_json::Value::Array(items)
@@ -4143,19 +4391,20 @@ fn normalize_cell_edit(original: &str, draft: &str) -> Result<String, String> {
     };
     if actual != Some(expected) {
         return Err(format!(
-            "JSON value must remain a {}",
+            "{} {}",
+            tr(Text::JsonValueMustRemain),
             json_structure_label(expected)
         ));
     }
     serde_json::to_string(&parsed).map_err(|error| error.to_string())
 }
 
-const fn json_structure_label(structure: JsonStructure) -> &'static str {
-    match structure {
-        JsonStructure::Object => "JSON object",
-        JsonStructure::Array => "one-dimensional JSON array",
-        JsonStructure::Array2d => "two-dimensional JSON array",
-    }
+fn json_structure_label(structure: JsonStructure) -> &'static str {
+    tr(match structure {
+        JsonStructure::Object => Text::JsonObject,
+        JsonStructure::Array => Text::JsonArray,
+        JsonStructure::Array2d => Text::JsonArray2d,
+    })
 }
 
 fn syntax_highlight_json(value: &str) -> String {
@@ -4323,7 +4572,7 @@ fn run_history_action(
         .write()
         .iter_mut()
         .find(|tab| tab.document.path == path)
-        .ok_or_else(|| "Open tab no longer exists".to_owned())
+        .ok_or_else(|| tr(Text::OpenTabMissing).to_owned())
         .and_then(|tab| {
             if redo { tab.redo() } else { tab.undo() }.map_err(|error| error.to_string())
         });
@@ -4331,17 +4580,20 @@ fn run_history_action(
         Ok(true) => {
             diagnostic_target.set(None);
             notice.set(Some(if redo {
-                "Redid the last edit".to_owned()
+                tr(Text::RedidEdit).to_owned()
             } else {
-                "Undid the last edit".to_owned()
+                tr(Text::UndidEdit).to_owned()
             }));
         }
         Ok(false) => notice.set(Some(if redo {
-            "Nothing to redo".to_owned()
+            tr(Text::NothingRedo).to_owned()
         } else {
-            "Nothing to undo".to_owned()
+            tr(Text::NothingUndo).to_owned()
         })),
-        Err(error) => notice.set(Some(error)),
+        Err(error) => notice.set(Some(l10n(Message::Technical {
+            prefix: Text::SaveError,
+            detail: &error,
+        }))),
     }
 }
 
@@ -4439,7 +4691,7 @@ fn navigate_diagnostic(
         state.ready_columns(session.document.analysis_version(), session.header_rows)
     });
     let Some(analyses) = analyses else {
-        notice.set(Some("Table analysis is still running".to_owned()));
+        notice.set(Some(tr(Text::AnalysisRunning).to_owned()));
         return;
     };
     let targets = diagnostic_targets(&analyses);
@@ -4447,7 +4699,7 @@ fn navigate_diagnostic(
     drop(tabs_read);
 
     let Some(target) = target else {
-        notice.set(Some("No cell problems or mixed columns".to_owned()));
+        notice.set(Some(tr(Text::NoProblems).to_owned()));
         return;
     };
     diagnostic_target.set(Some(target));
@@ -4458,15 +4710,14 @@ fn navigate_diagnostic(
                 row_index: position.row_index,
                 column_index: position.column_index,
             }));
-            notice.set(Some(format!(
-                "Problem at row {}, column {}",
-                position.row_index.saturating_sub(header_rows) + 1,
-                position.column_index + 1
-            )));
+            notice.set(Some(l10n(Message::ProblemAt {
+                row: position.row_index.saturating_sub(header_rows) + 1,
+                column: position.column_index + 1,
+            })));
         }
         DiagnosticTarget::Column(column_index) => {
             selected_cell.set(None);
-            notice.set(Some(format!("Mixed types in column {}", column_index + 1)));
+            notice.set(Some(l10n(Message::MixedColumn(column_index + 1))));
         }
     }
     scroll_to_target(target, header_rows);
@@ -4537,16 +4788,14 @@ fn attempt_save_tab(
     } else {
         let tabs_read = tabs.read();
         let Some(tab) = tabs_read.iter().find(|tab| &tab.document.path == path) else {
-            notice.set(Some("Open tab no longer exists".to_owned()));
+            notice.set(Some(tr(Text::OpenTabMissing).to_owned()));
             return false;
         };
         let analyses = table_analyses.read().get(path).and_then(|state| {
             state.ready_columns(tab.document.analysis_version(), tab.header_rows)
         });
         let Some(analyses) = analyses else {
-            notice.set(Some(
-                "Table analysis is still running; save again when it finishes".to_owned(),
-            ));
+            notice.set(Some(tr(Text::AnalysisRunningSave).to_owned()));
             return false;
         };
         analyses
@@ -4556,25 +4805,24 @@ fn attempt_save_tab(
     };
     if text_parse_issue.is_some() || problem_count > 0 {
         let description = match text_parse_issue.as_ref() {
-            Some(issue) => format!(
-                "This text contains {} CSV parse error(s). First error: {}\n\nSaving anyway will preserve the invalid CSV text.",
-                issue.count, issue.message
-            ),
-            None => format!(
-                "This file contains {problem_count} cells with red compatibility or structure problems."
-            ),
+            Some(issue) => l10n(Message::SaveParseProblems {
+                count: issue.count,
+                detail: &issue.message,
+            }),
+            None => l10n(Message::SaveCellProblems(problem_count)),
         };
+        let save_anyway = tr(Text::SaveAnyway);
         let choice = MessageDialog::new()
             .set_level(MessageLevel::Warning)
-            .set_title("Save CSV with problems?")
+            .set_title(tr(Text::SaveProblemsTitle))
             .set_description(description)
             .set_buttons(MessageButtons::OkCancelCustom(
-                "Save anyway".to_owned(),
-                "Cancel".to_owned(),
+                save_anyway.to_owned(),
+                tr(Text::Cancel).to_owned(),
             ))
             .show();
         let confirmed = matches!(choice, MessageDialogResult::Ok)
-            || matches!(&choice, MessageDialogResult::Custom(label) if label == "Save anyway");
+            || matches!(&choice, MessageDialogResult::Custom(label) if label == save_anyway);
         if !confirmed {
             return false;
         }
@@ -4583,14 +4831,14 @@ fn attempt_save_tab(
     let result = {
         let mut tabs_write = tabs.write();
         let Some(tab) = tabs_write.iter_mut().find(|tab| &tab.document.path == path) else {
-            notice.set(Some("Open tab no longer exists".to_owned()));
+            notice.set(Some(tr(Text::OpenTabMissing).to_owned()));
             return false;
         };
         tab.save(false)
     };
     match result {
         Ok(()) => {
-            notice.set(Some(format!("Saved {}", file_name(path))));
+            notice.set(Some(l10n(Message::Saved(&file_name(path)))));
             true
         }
         Err(DocumentSessionError::ExternalModification { .. }) => resolve_external_conflict(
@@ -4602,7 +4850,10 @@ fn attempt_save_tab(
             notice,
         ),
         Err(error) => {
-            notice.set(Some(error.to_string()));
+            notice.set(Some(l10n(Message::Technical {
+                prefix: Text::SaveError,
+                detail: &error.to_string(),
+            })));
             false
         }
     }
@@ -4616,32 +4867,31 @@ fn resolve_external_conflict(
     mut diagnostic_target: Signal<Option<DiagnosticTarget>>,
     mut notice: Signal<Option<String>>,
 ) -> bool {
+    let overwrite_label = tr(Text::OverwriteDiskFile);
+    let reload_label = tr(Text::ReloadDiskFile);
     let choice = MessageDialog::new()
         .set_level(MessageLevel::Warning)
-        .set_title("File changed on disk")
-        .set_description(format!(
-            "{} changed after it was opened. Overwrite the disk file, reload it, or cancel?",
-            file_name(path)
-        ))
+        .set_title(tr(Text::FileChangedTitle))
+        .set_description(l10n(Message::FileChanged(&file_name(path))))
         .set_buttons(MessageButtons::YesNoCancelCustom(
-            "Overwrite disk file".to_owned(),
-            "Reload disk file".to_owned(),
-            "Cancel".to_owned(),
+            overwrite_label.to_owned(),
+            reload_label.to_owned(),
+            tr(Text::Cancel).to_owned(),
         ))
         .show();
 
     if matches!(choice, MessageDialogResult::Yes)
-        || matches!(&choice, MessageDialogResult::Custom(label) if label == "Overwrite disk file")
+        || matches!(&choice, MessageDialogResult::Custom(label) if label == overwrite_label)
     {
         let result = tabs
             .write()
             .iter_mut()
             .find(|tab| &tab.document.path == path)
-            .ok_or_else(|| "Open tab no longer exists".to_owned())
+            .ok_or_else(|| tr(Text::OpenTabMissing).to_owned())
             .and_then(|tab| tab.save(true).map_err(|error| error.to_string()));
         return match result {
             Ok(()) => {
-                notice.set(Some(format!("Overwrote {}", file_name(path))));
+                notice.set(Some(l10n(Message::Overwrote(&file_name(path)))));
                 true
             }
             Err(error) => {
@@ -4652,19 +4902,20 @@ fn resolve_external_conflict(
     }
 
     if matches!(choice, MessageDialogResult::No)
-        || matches!(&choice, MessageDialogResult::Custom(label) if label == "Reload disk file")
+        || matches!(&choice, MessageDialogResult::Custom(label) if label == reload_label)
     {
+        let discard_label = tr(Text::DiscardAndReload);
         let confirm = MessageDialog::new()
             .set_level(MessageLevel::Warning)
-            .set_title("Discard local changes?")
-            .set_description("Reloading will permanently discard all unsaved edits in this tab.")
+            .set_title(tr(Text::DiscardLocalTitle))
+            .set_description(tr(Text::DiscardDescription))
             .set_buttons(MessageButtons::OkCancelCustom(
-                "Discard and reload".to_owned(),
-                "Cancel".to_owned(),
+                discard_label.to_owned(),
+                tr(Text::Cancel).to_owned(),
             ))
             .show();
         if !matches!(confirm, MessageDialogResult::Ok)
-            && !matches!(&confirm, MessageDialogResult::Custom(label) if label == "Discard and reload")
+            && !matches!(&confirm, MessageDialogResult::Custom(label) if label == discard_label)
         {
             return false;
         }
@@ -4672,14 +4923,14 @@ fn resolve_external_conflict(
             .write()
             .iter_mut()
             .find(|tab| &tab.document.path == path)
-            .ok_or_else(|| "Open tab no longer exists".to_owned())
+            .ok_or_else(|| tr(Text::OpenTabMissing).to_owned())
             .and_then(|tab| tab.reload().map_err(|error| error.to_string()));
         return match result {
             Ok(()) => {
                 cell_draft.set(None);
                 selected_cell.set(None);
                 diagnostic_target.set(None);
-                notice.set(Some(format!("Reloaded {}", file_name(path))));
+                notice.set(Some(l10n(Message::Reloaded(&file_name(path)))));
                 true
             }
             Err(error) => {
@@ -4734,7 +4985,7 @@ fn confirm_close_all_tabs(
     diagnostic_target: Signal<Option<DiagnosticTarget>>,
     table_analyses: Signal<HashMap<PathBuf, TableAnalysisState>>,
     notice: Signal<Option<String>>,
-    action: &str,
+    action: CloseAction,
 ) -> bool {
     let paths = {
         let tabs_read = tabs.read();
@@ -4745,22 +4996,24 @@ fn confirm_close_all_tabs(
         return true;
     }
 
+    let save_all_label = tr(Text::SaveAll);
+    let dont_save_label = tr(Text::DontSave);
     let choice = MessageDialog::new()
         .set_level(MessageLevel::Warning)
-        .set_title("Unsaved files")
-        .set_description(format!(
-            "{} open files have unsaved changes. Save all before {action}?",
-            paths.len()
-        ))
+        .set_title(tr(Text::UnsavedFiles))
+        .set_description(l10n(Message::UnsavedFiles {
+            count: paths.len(),
+            action,
+        }))
         .set_buttons(MessageButtons::YesNoCancelCustom(
-            "Save all".to_owned(),
-            "Don't save".to_owned(),
-            "Return to editing".to_owned(),
+            save_all_label.to_owned(),
+            dont_save_label.to_owned(),
+            tr(Text::ReturnToEditing).to_owned(),
         ))
         .show();
 
     if matches!(choice, MessageDialogResult::Yes)
-        || matches!(&choice, MessageDialogResult::Custom(label) if label == "Save all")
+        || matches!(&choice, MessageDialogResult::Custom(label) if label == save_all_label)
     {
         for path in paths {
             if !attempt_save_tab(
@@ -4779,7 +5032,7 @@ fn confirm_close_all_tabs(
     }
 
     matches!(choice, MessageDialogResult::No)
-        || matches!(&choice, MessageDialogResult::Custom(label) if label == "Don't save")
+        || matches!(&choice, MessageDialogResult::Custom(label) if label == dont_save_label)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4813,21 +5066,20 @@ fn request_close_tab(
         return;
     }
 
+    let save_label = tr(Text::Save);
+    let dont_save_label = tr(Text::DontSave);
     let choice = MessageDialog::new()
         .set_level(MessageLevel::Warning)
-        .set_title("Unsaved changes")
-        .set_description(format!(
-            "Save changes to {} before closing?",
-            file_name(&path)
-        ))
+        .set_title(tr(Text::UnsavedChanges))
+        .set_description(l10n(Message::SaveChanges(&file_name(&path))))
         .set_buttons(MessageButtons::YesNoCancelCustom(
-            "Save".to_owned(),
-            "Don't save".to_owned(),
-            "Cancel".to_owned(),
+            save_label.to_owned(),
+            dont_save_label.to_owned(),
+            tr(Text::Cancel).to_owned(),
         ))
         .show();
     let should_close = if matches!(choice, MessageDialogResult::Yes)
-        || matches!(&choice, MessageDialogResult::Custom(label) if label == "Save")
+        || matches!(&choice, MessageDialogResult::Custom(label) if label == save_label)
     {
         attempt_save_tab(
             &path,
@@ -4840,7 +5092,7 @@ fn request_close_tab(
         )
     } else {
         matches!(choice, MessageDialogResult::No)
-            || matches!(&choice, MessageDialogResult::Custom(label) if label == "Don't save")
+            || matches!(&choice, MessageDialogResult::Custom(label) if label == dont_save_label)
     };
     if should_close {
         close_tab_now(
@@ -4885,20 +5137,18 @@ fn reload_external_tab(
     mut notice: Signal<Option<String>>,
 ) {
     if confirm_discard {
+        let discard_label = tr(Text::DiscardAndReload);
         let choice = MessageDialog::new()
             .set_level(MessageLevel::Warning)
-            .set_title("Discard local changes?")
-            .set_description(format!(
-                "Reloading {} will permanently discard all unsaved edits in this tab.",
-                file_name(&path)
-            ))
+            .set_title(tr(Text::DiscardLocalTitle))
+            .set_description(l10n(Message::ReloadDiscard(&file_name(&path))))
             .set_buttons(MessageButtons::OkCancelCustom(
-                "Discard and reload".to_owned(),
-                "Cancel".to_owned(),
+                discard_label.to_owned(),
+                tr(Text::Cancel).to_owned(),
             ))
             .show();
         if !matches!(choice, MessageDialogResult::Ok)
-            && !matches!(&choice, MessageDialogResult::Custom(label) if label == "Discard and reload")
+            && !matches!(&choice, MessageDialogResult::Custom(label) if label == discard_label)
         {
             return;
         }
@@ -4910,7 +5160,7 @@ fn reload_external_tab(
         .find(|tab| tab.document.path == path)
         .map(|tab| (tab.delimiter_override(), tab.header_rows, tab.view()));
     let Some((delimiter, header_rows, previous_view)) = options else {
-        notice.set(Some("Open tab no longer exists".to_owned()));
+        notice.set(Some(tr(Text::OpenTabMissing).to_owned()));
         return;
     };
     spawn(async move {
@@ -4941,19 +5191,25 @@ fn reload_external_tab(
                 diagnostic_target.set(None);
                 external_conflicts.write().remove(&path);
                 external_reload_errors.write().remove(&path);
-                notice.set(Some(format!("Reloaded {}", file_name(&path))));
+                notice.set(Some(l10n(Message::Reloaded(&file_name(&path)))));
             }
             Ok(Err(error)) => {
                 external_reload_errors
                     .write()
                     .insert(path.clone(), error.to_string());
-                notice.set(Some(error.to_string()));
+                notice.set(Some(l10n(Message::Technical {
+                    prefix: Text::ReloadError,
+                    detail: &error.to_string(),
+                })));
             }
             Err(error) => {
                 external_reload_errors
                     .write()
                     .insert(path.clone(), error.to_string());
-                notice.set(Some(error.to_string()));
+                notice.set(Some(l10n(Message::Technical {
+                    prefix: Text::ReloadError,
+                    detail: &error.to_string(),
+                })));
             }
         }
     });
@@ -5013,26 +5269,28 @@ fn document_status(
     let dimensions = if table_view {
         document
             .dimensions(header_rows)
-            .map(|(rows, columns)| format!("{rows} rows · {columns} columns"))
-            .unwrap_or_else(|| format!("requires {header_rows} header rows"))
+            .map(|(rows, columns)| l10n(Message::RowsColumns { rows, columns }))
+            .unwrap_or_else(|| l10n(Message::RequiresHeaderRows(header_rows)))
     } else {
-        format!("{} physical lines", physical_line_count(text))
+        physical_lines(physical_line_count(text))
     };
     let position = if table_view {
         selected_cell
             .filter(|location| location.path == document.path && location.row_index >= header_rows)
             .map(|location| {
-                format!(
-                    "Row {}, Col {}",
-                    location.row_index - header_rows + 1,
-                    location.column_index + 1
-                )
+                l10n(Message::TablePosition {
+                    row: location.row_index - header_rows + 1,
+                    column: location.column_index + 1,
+                })
             })
     } else {
         let cursor = text_cursor.filter(|cursor| cursor.path == document.path);
         Some(match cursor {
-            Some(cursor) => format!("Ln {}, Col {}", cursor.line, cursor.column),
-            None => "Ln 1, Col 1".to_owned(),
+            Some(cursor) => l10n(Message::TextPosition {
+                line: cursor.line,
+                column: cursor.column,
+            }),
+            None => l10n(Message::TextPosition { line: 1, column: 1 }),
         })
     };
     let analyses = table_view
@@ -5172,12 +5430,14 @@ mod tests {
     }
 
     #[test]
-    fn focus_mode_keeps_only_the_selected_column_and_its_neighbors() {
-        assert_eq!(column_focus_class(0, Some(2)), "column-hidden");
-        assert_eq!(column_focus_class(1, Some(2)), "focus-neighbor");
-        assert_eq!(column_focus_class(2, Some(2)), "focus-column");
-        assert_eq!(column_focus_class(3, Some(2)), "focus-neighbor");
-        assert_eq!(column_focus_class(4, Some(2)), "column-hidden");
+    fn focus_mode_maps_dynamic_layout_roles_to_css_classes() {
+        let layout = FocusLayout::calculate(7, 3, 320, 1_100.0).unwrap();
+
+        assert_eq!(column_focus_class(0, Some(&layout)), "column-hidden");
+        assert_eq!(column_focus_class(2, Some(&layout)), "focus-left-neighbor");
+        assert_eq!(column_focus_class(3, Some(&layout)), "focus-column");
+        assert_eq!(column_focus_class(5, Some(&layout)), "focus-right-neighbor");
+        assert_eq!(column_focus_class(6, Some(&layout)), "column-hidden");
         assert_eq!(column_focus_class(4, None), "");
     }
 
@@ -5185,6 +5445,40 @@ mod tests {
     fn focused_column_width_is_bounded_for_short_and_long_content() {
         assert_eq!(focus_column_width(5), 320);
         assert_eq!(focus_column_width(1_000), 720);
+    }
+
+    #[test]
+    fn read_only_cells_select_and_switch_focus_without_entering_edit_mode() {
+        assert_eq!(
+            cell_click_action(true, false, None, 2),
+            CellClickAction::Select
+        );
+        assert_eq!(
+            cell_click_action(true, true, Some(2), 2),
+            CellClickAction::Select
+        );
+        assert_eq!(
+            cell_click_action(true, false, Some(2), 3),
+            CellClickAction::SwitchFocus
+        );
+        assert_eq!(
+            cell_click_action(false, true, None, 2),
+            CellClickAction::Edit
+        );
+    }
+
+    #[test]
+    fn focused_column_navigation_uses_the_rendered_document_column_count() {
+        assert_eq!(next_focused_column(0, -1, 5), 0);
+        assert_eq!(next_focused_column(2, 1, 5), 3);
+        assert_eq!(next_focused_column(4, 1, 5), 4);
+        assert_eq!(next_focused_column(0, 1, 0), 0);
+    }
+
+    #[test]
+    fn f1_shortcut_command_deserializes_to_the_shortcuts_panel() {
+        let command: WindowShortcutCommand = serde_json::from_str("\"shortcuts\"").unwrap();
+        assert_eq!(command, WindowShortcutCommand::Shortcuts);
     }
 
     #[test]
@@ -5232,7 +5526,10 @@ mod tests {
             Some(&analysis),
         );
 
-        assert_eq!(status.position.as_deref(), Some("Row 2, Col 2"));
+        assert_eq!(
+            status.position.as_deref(),
+            Some(l10n(Message::TablePosition { row: 2, column: 2 }).as_str())
+        );
         assert_eq!(status.red_cells, Some(0));
         assert_eq!(status.yellow_columns, Some(2));
         assert!(!status.analysis_loading);
@@ -5260,7 +5557,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(status.position.as_deref(), Some("Ln 2, Col 4"));
+        assert_eq!(
+            status.position.as_deref(),
+            Some(l10n(Message::TextPosition { line: 2, column: 4 }).as_str())
+        );
         assert_eq!(status.red_cells, None);
         assert!(!status.analysis_loading);
     }
