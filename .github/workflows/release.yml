@@ -19,7 +19,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - id: version
         name: Validate version sources
@@ -55,7 +55,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
@@ -81,7 +81,7 @@ jobs:
           Copy-Item target\release\gconf.exe dist\windows\bin\gconf.exe
       - name: Upload Windows artifact
         if: matrix.platform == 'windows-x64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-x64
           path: dist/windows/bin/gconf.exe
@@ -159,7 +159,7 @@ jobs:
         run: tar -C dist/macos -czf dist/game-config-edit-darwin-arm64.tar.gz "Game Config Edit.app"
       - name: Upload macOS artifact
         if: matrix.platform == 'macos-arm64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-arm64
           path: dist/game-config-edit-darwin-arm64.tar.gz
@@ -176,16 +176,16 @@ jobs:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-x64
           path: npm/game-config-edit-win32-x64/bin
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: macos-arm64
           path: dist/macos
@@ -235,8 +235,8 @@ jobs:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org

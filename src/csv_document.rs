@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
-const DELIMITER_CANDIDATES: [u8; 4] = [b',', b'\t', b';', b'|'];
+const DELIMITER_CANDIDATES: [u8; 4] = *b",\t;|";
 const SAMPLE_RECORD_LIMIT: usize = 50;
 static NEXT_ANALYSIS_VERSION: AtomicU64 = AtomicU64::new(1);
 
