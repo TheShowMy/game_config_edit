@@ -121,8 +121,9 @@ mod tests {
     #[test]
     fn observes_a_real_csv_creation() {
         let directory = tempfile::tempdir().unwrap();
-        let mut monitor = WorkspaceMonitor::new(directory.path()).unwrap();
-        let created_path = directory.path().join("heroes.csv");
+        let root = directory.path().canonicalize().unwrap();
+        let mut monitor = WorkspaceMonitor::new(&root).unwrap();
+        let created_path = root.join("heroes.csv");
         fs::write(&created_path, "id,name\n1,Arthur\n").unwrap();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
