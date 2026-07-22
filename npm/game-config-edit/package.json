@@ -1,0 +1,28 @@
+{
+  "name": "game-config-edit",
+  "version": "0.1.0",
+  "description": "A desktop CSV configuration editor for game development",
+  "type": "module",
+  "bin": {
+    "gconf": "bin/gconf.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "optionalDependencies": {
+    "game-config-edit-darwin-arm64": "0.1.0",
+    "game-config-edit-win32-x64": "0.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheShowMy/game_config_edit.git"
+  },
+  "homepage": "https://github.com/TheShowMy/game_config_edit#readme",
+  "bugs": "https://github.com/TheShowMy/game_config_edit/issues",
+  "license": "UNLICENSED"
+}

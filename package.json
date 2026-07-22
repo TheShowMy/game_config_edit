@@ -1,0 +1,14 @@
+{
+  "name": "game-config-edit-repository",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test npm/game-config-edit/test/*.test.js scripts/*.test.mjs",
+    "release:set-version": "node scripts/set-release-version.mjs",
+    "release:validate": "node scripts/validate-release-packages.mjs"
+  }
+}

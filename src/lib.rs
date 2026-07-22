@@ -1,0 +1,11 @@
+pub mod csv_document;
+pub mod diagnostics;
+pub mod document_session;
+pub mod editor_navigation;
+pub mod file_monitor;
+pub mod platform;
+pub mod search;
+pub mod settings;
+pub mod startup;
+pub mod table_virtualization;
+pub mod workspace;

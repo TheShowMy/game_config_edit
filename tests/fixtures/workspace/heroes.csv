@@ -1,0 +1,5 @@
+Identifier,Display name,Health,Enabled,Metadata,Tags
+id,name,hp,enabled,metadata,tags
+101,Arthur,500,true,"{""class"":""knight""}","[""melee"",""tank""]"
+102,Merlin,300,false,"{""class"":""mage""}","[""ranged"",""magic""]"
+103,Lancelot,450,true,not-json,"[""melee"",""burst""]"

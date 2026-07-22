@@ -1,0 +1,20 @@
+{
+  "name": "game-config-edit-win32-x64",
+  "version": "0.1.0",
+  "description": "Windows x64 native binary for game-config-edit",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/gconf.exe",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheShowMy/game_config_edit.git"
+  },
+  "license": "UNLICENSED"
+}

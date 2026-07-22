@@ -1,0 +1,20 @@
+{
+  "name": "game-config-edit-darwin-arm64",
+  "version": "0.1.0",
+  "description": "macOS Apple Silicon native application for game-config-edit",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "Game Config Edit.app",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheShowMy/game_config_edit.git"
+  },
+  "license": "UNLICENSED"
+}

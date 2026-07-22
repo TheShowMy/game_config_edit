@@ -1,0 +1,287 @@
+name: Release npm packages
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: version
+        name: Validate version sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must match vX.Y.Z" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "game-config-edit") | .version')"
+          if [[ "$cargo_version" != "$version" ]]; then
+            echo "Cargo version $cargo_version does not match tag version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-native:
+    name: Build ${{ matrix.name }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            platform: windows-x64
+            runner: windows-latest
+          - name: macOS Apple Silicon
+            platform: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - name: Run P6 Release performance baseline
+        run: cargo test --release --test performance_baseline -- --ignored --nocapture --test-threads=1
+      - run: cargo build --release
+      - name: Smoke test Windows binary
+        if: matrix.platform == 'windows-x64'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          node -e "const { spawnSync } = require('node:child_process'); const result = spawnSync('target/release/gconf.exe', ['--version'], { encoding: 'utf8' }); if (result.error) throw result.error; if (result.status !== 0) { console.error(result.stderr); process.exit(result.status ?? 1); } const actual = result.stdout.trim(); const expected = 'gconf ' + process.env.VERSION; if (actual !== expected) throw new Error('Expected ' + expected + ', got ' + actual); console.log(actual);"
+      - name: Prepare native package
+        if: matrix.platform == 'windows-x64'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\windows\bin | Out-Null
+          Copy-Item target\release\gconf.exe dist\windows\bin\gconf.exe
+      - name: Upload Windows artifact
+        if: matrix.platform == 'windows-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/windows/bin/gconf.exe
+          if-no-files-found: error
+      - name: Verify Apple Silicon runner
+        if: matrix.platform == 'macos-arm64'
+        run: test "$(uname -m)" = "arm64"
+      - name: Smoke test macOS binary
+        if: matrix.platform == 'macos-arm64'
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: test "$(target/release/gconf --version)" = "gconf $VERSION"
+      - name: Build app bundle
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          app="dist/macos/Game Config Edit.app"
+          mkdir -p "$app/Contents/MacOS"
+          cp target/release/gconf "$app/Contents/MacOS/gconf"
+          chmod +x "$app/Contents/MacOS/gconf"
+          cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$app/Contents/Info.plist"
+      - name: Import signing certificate
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_CERTIFICATE_BASE64:?APPLE_CERTIFICATE_BASE64 is required}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?APPLE_CERTIFICATE_PASSWORD is required}"
+          : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY is required}"
+          certificate="$RUNNER_TEMP/certificate.p12"
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychain -d user -s "$keychain"
+      - name: Sign and notarize app
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ vars.APPLE_ID || secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID || secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_ID:?APPLE_ID is required}"
+          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
+          : "${APPLE_APP_PASSWORD:?APPLE_APP_PASSWORD is required}"
+          app="dist/macos/Game Config Edit.app"
+          codesign --force --deep --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/game-config-edit.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/game-config-edit.zip" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+      - name: Archive app bundle
+        if: matrix.platform == 'macos-arm64'
+        run: tar -C dist/macos -czf dist/game-config-edit-darwin-arm64.tar.gz "Game Config Edit.app"
+      - name: Upload macOS artifact
+        if: matrix.platform == 'macos-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/game-config-edit-darwin-arm64.tar.gz
+          if-no-files-found: error
+
+  publish-platforms:
+    name: Publish native npm packages
+    needs: [validate, build-native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: npm/game-config-edit-win32-x64/bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/macos
+      - name: Prepare packages
+        run: |
+          tar -C npm/game-config-edit-darwin-arm64 -xzf dist/macos/game-config-edit-darwin-arm64.tar.gz
+          node scripts/set-release-version.mjs "$VERSION"
+      - name: Validate package metadata and contents
+        run: node scripts/validate-release-packages.mjs "$VERSION"
+      - name: Verify npm authentication
+        run: npm whoami
+      - name: Publish Windows package
+        shell: bash
+        run: |
+          if npm view "game-config-edit-win32-x64@$VERSION" version >/dev/null 2>&1; then
+            published_sha="$(npm view "game-config-edit-win32-x64@$VERSION" gitHead)"
+            if [[ "$published_sha" != "$GITHUB_SHA" ]]; then
+              echo "game-config-edit-win32-x64@$VERSION already exists from commit ${published_sha:-unknown}; create a new version tag" >&2
+              exit 1
+            fi
+            echo "game-config-edit-win32-x64@$VERSION was already published from this commit"
+          else
+            npm publish --access public --tag latest --provenance --workspace=false ./npm/game-config-edit-win32-x64
+          fi
+      - name: Publish macOS package
+        shell: bash
+        run: |
+          if npm view "game-config-edit-darwin-arm64@$VERSION" version >/dev/null 2>&1; then
+            published_sha="$(npm view "game-config-edit-darwin-arm64@$VERSION" gitHead)"
+            if [[ "$published_sha" != "$GITHUB_SHA" ]]; then
+              echo "game-config-edit-darwin-arm64@$VERSION already exists from commit ${published_sha:-unknown}; create a new version tag" >&2
+              exit 1
+            fi
+            echo "game-config-edit-darwin-arm64@$VERSION was already published from this commit"
+          else
+            npm publish --access public --tag latest --provenance --workspace=false ./npm/game-config-edit-darwin-arm64
+          fi
+
+  publish-main:
+    name: Publish main npm package
+    needs: [validate, publish-platforms]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: node scripts/set-release-version.mjs "$VERSION"
+      - run: npm test
+      - run: npm pack --dry-run --workspace=false ./npm/game-config-edit
+      - name: Verify npm authentication
+        run: npm whoami
+      - name: Publish main package
+        shell: bash
+        run: |
+          if npm view "game-config-edit@$VERSION" version >/dev/null 2>&1; then
+            published_sha="$(npm view "game-config-edit@$VERSION" gitHead)"
+            if [[ "$published_sha" != "$GITHUB_SHA" ]]; then
+              echo "game-config-edit@$VERSION already exists from commit ${published_sha:-unknown}; create a new version tag" >&2
+              exit 1
+            fi
+            echo "game-config-edit@$VERSION was already published from this commit"
+          else
+            npm publish --access public --tag latest --provenance --workspace=false ./npm/game-config-edit
+          fi
+      - name: Record published packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## npm release $VERSION"
+            echo
+            echo "| Package | Version | Integrity | SHA-1 |"
+            echo "|---|---:|---|---|"
+            for package in game-config-edit-win32-x64 game-config-edit-darwin-arm64 game-config-edit; do
+              metadata=""
+              for attempt in 1 2 3 4 5 6; do
+                if metadata="$(npm view "$package@$VERSION" dist --json 2>/dev/null)"; then
+                  break
+                fi
+                sleep 5
+              done
+              if [[ -z "$metadata" ]]; then
+                echo "Unable to read $package@$VERSION from npm" >&2
+                exit 1
+              fi
+              integrity="$(jq -r '.integrity // "missing"' <<<"$metadata")"
+              shasum="$(jq -r '.shasum // "missing"' <<<"$metadata")"
+              url="https://www.npmjs.com/package/$package/v/$VERSION"
+              echo "| [$package]($url) | $VERSION | \`$integrity\` | \`$shasum\` |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,34 @@
+[package]
+name = "game-config-edit"
+version = "0.1.0"
+edition = "2024"
+description = "A desktop CSV configuration editor for game development"
+repository = "https://github.com/TheShowMy/game_config_edit"
+license = "UNLICENSED"
+default-run = "gconf"
+
+[[bin]]
+name = "gconf"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+csv = "1.4"
+directories = "6.0"
+dioxus = { version = "0.7", features = ["desktop"] }
+notify = "8.2"
+rfd = { version = "0.15", features = ["common-controls-v6"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0"
+tempfile = "3.23"
+tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
+walkdir = "2.5"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
