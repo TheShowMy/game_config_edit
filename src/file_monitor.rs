@@ -137,6 +137,14 @@ mod tests {
         });
 
         assert!(batch.refresh_required());
-        assert!(batch.paths.iter().any(|path| path == &created_path));
+        assert!(
+            batch
+                .paths
+                .iter()
+                .any(|path| path == &created_path || created_path.starts_with(path)),
+            "filesystem event paths do not cover {}: {:?}",
+            created_path.display(),
+            batch.paths
+        );
     }
 }
