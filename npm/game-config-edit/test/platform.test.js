@@ -26,6 +26,6 @@ test("resolves the executable inside each native package", () => {
   );
   assert.equal(
     executableFor("/package", "darwin", "arm64"),
-    path.join("/package", "Game Config Edit.app", "Contents", "MacOS", "gconf"),
+    path.join("/package", "bin", "gconf"),
   );
 });

@@ -1,7 +1,7 @@
 {
   "name": "game-config-edit-darwin-arm64",
   "version": "0.1.0",
-  "description": "macOS Apple Silicon native application for game-config-edit",
+  "description": "macOS Apple Silicon native binary for game-config-edit",
   "os": [
     "darwin"
   ],
@@ -9,7 +9,7 @@
     "arm64"
   ],
   "files": [
-    "Game Config Edit.app",
+    "bin/gconf",
     "README.md"
   ],
   "repository": {

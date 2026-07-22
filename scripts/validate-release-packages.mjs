@@ -28,14 +28,7 @@ const packages = [
     name: "game-config-edit-darwin-arm64",
     os: ["darwin"],
     cpu: ["arm64"],
-    files: [
-      "Game Config Edit.app/Contents/CodeResources",
-      "Game Config Edit.app/Contents/Info.plist",
-      "Game Config Edit.app/Contents/MacOS/gconf",
-      "Game Config Edit.app/Contents/_CodeSignature/CodeResources",
-      "README.md",
-      "package.json",
-    ],
+    files: ["README.md", "bin/gconf", "package.json"],
   },
 ];
 const packageReports = [];
@@ -77,36 +70,13 @@ for (const definition of packages) {
     assertStringArray(manifest.os, definition.os, `${definition.name}: invalid os`);
     assertStringArray(manifest.cpu, definition.cpu, `${definition.name}: invalid cpu`);
     if (definition.name === "game-config-edit-darwin-arm64") {
-      const executable = path.join(
-        packageRoot,
-        "Game Config Edit.app",
-        "Contents",
-        "MacOS",
-        "gconf",
-      );
+      const executable = path.join(packageRoot, "bin", "gconf");
       if (process.platform !== "win32") {
         assert(
           (fs.statSync(executable).mode & 0o111) !== 0,
           `${definition.name}: bundled gconf must be executable`,
         );
       }
-      const plist = fs.readFileSync(
-        path.join(packageRoot, "Game Config Edit.app", "Contents", "Info.plist"),
-        "utf8",
-      );
-      const escapedVersion = version.replaceAll(".", "\\.");
-      assert(
-        new RegExp(
-          `<key>CFBundleShortVersionString</key>\\s*<string>${escapedVersion}</string>`,
-        ).test(plist),
-        `${definition.name}: CFBundleShortVersionString must be ${version}`,
-      );
-      assert(
-        new RegExp(
-          `<key>CFBundleVersion</key>\\s*<string>${escapedVersion}</string>`,
-        ).test(plist),
-        `${definition.name}: CFBundleVersion must be ${version}`,
-      );
     }
   } else {
     assert(manifest.engines?.node === ">=22", `${definition.name}: Node >=22 is required`);

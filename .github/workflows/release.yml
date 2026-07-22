@@ -94,75 +94,20 @@ jobs:
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: test "$(target/release/gconf --version)" = "gconf $VERSION"
-      - name: Build app bundle
+      - name: Prepare macOS native package
         if: matrix.platform == 'macos-arm64'
         shell: bash
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          app="dist/macos/Game Config Edit.app"
-          mkdir -p "$app/Contents/MacOS"
-          cp target/release/gconf "$app/Contents/MacOS/gconf"
-          chmod +x "$app/Contents/MacOS/gconf"
-          cp packaging/macos/Info.plist "$app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$app/Contents/Info.plist"
-      - name: Import signing certificate
-        if: matrix.platform == 'macos-arm64'
-        shell: bash
-        env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || secrets.APPLE_SIGNING_IDENTITY }}
-        run: |
-          set -euo pipefail
-          : "${APPLE_CERTIFICATE_BASE64:?APPLE_CERTIFICATE_BASE64 is required}"
-          : "${APPLE_CERTIFICATE_PASSWORD:?APPLE_CERTIFICATE_PASSWORD is required}"
-          : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY is required}"
-          certificate="$RUNNER_TEMP/certificate.p12"
-          keychain="$RUNNER_TEMP/release.keychain-db"
-          keychain_password="$(openssl rand -hex 24)"
-          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$certificate"
-          security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security import "$certificate" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
-          security list-keychain -d user -s "$keychain"
-      - name: Sign and notarize app
-        if: matrix.platform == 'macos-arm64'
-        shell: bash
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ vars.APPLE_ID || secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID || secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: |
-          set -euo pipefail
-          : "${APPLE_ID:?APPLE_ID is required}"
-          : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
-          : "${APPLE_APP_PASSWORD:?APPLE_APP_PASSWORD is required}"
-          app="dist/macos/Game Config Edit.app"
-          codesign --force --deep --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$app"
-          codesign --verify --deep --strict --verbose=2 "$app"
-          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/game-config-edit.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/game-config-edit.zip" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_PASSWORD" \
-            --wait
-          xcrun stapler staple "$app"
-          xcrun stapler validate "$app"
-      - name: Archive app bundle
-        if: matrix.platform == 'macos-arm64'
-        run: tar -C dist/macos -czf dist/game-config-edit-darwin-arm64.tar.gz "Game Config Edit.app"
+          mkdir -p dist/macos/bin
+          cp target/release/gconf dist/macos/bin/gconf
+          chmod +x dist/macos/bin/gconf
       - name: Upload macOS artifact
         if: matrix.platform == 'macos-arm64'
         uses: actions/upload-artifact@v7
         with:
           name: macos-arm64
-          path: dist/game-config-edit-darwin-arm64.tar.gz
+          path: dist/macos/bin/gconf
           if-no-files-found: error
 
   publish-platforms:
@@ -188,10 +133,10 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: macos-arm64
-          path: dist/macos
+          path: npm/game-config-edit-darwin-arm64/bin
       - name: Prepare packages
         run: |
-          tar -C npm/game-config-edit-darwin-arm64 -xzf dist/macos/game-config-edit-darwin-arm64.tar.gz
+          chmod +x npm/game-config-edit-darwin-arm64/bin/gconf
           node scripts/set-release-version.mjs "$VERSION"
       - name: Validate package metadata and contents
         run: node scripts/validate-release-packages.mjs "$VERSION"

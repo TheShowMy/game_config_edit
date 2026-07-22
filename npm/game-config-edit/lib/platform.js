@@ -21,11 +21,5 @@ export function executableFor(packageRoot, platform, arch) {
   if (platform === "win32") {
     return path.join(packageRoot, "bin", "gconf.exe");
   }
-  return path.join(
-    packageRoot,
-    "Game Config Edit.app",
-    "Contents",
-    "MacOS",
-    "gconf",
-  );
+  return path.join(packageRoot, "bin", "gconf");
 }

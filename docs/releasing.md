@@ -1,6 +1,6 @@
 # npm release
 
-Pushing a three-part numeric tag matching `vX.Y.Z`, such as `v0.1.0`, starts `.github/workflows/release.yml`. The workflow builds and tests the Windows x64 and macOS Apple Silicon applications, signs and notarizes the macOS application, validates the exact npm package contents, then publishes these npm packages in order:
+Pushing a three-part numeric tag matching `vX.Y.Z`, such as `v0.1.0`, starts `.github/workflows/release.yml`. The workflow builds and tests the Windows x64 and macOS Apple Silicon binaries, validates the exact npm package contents, then publishes these npm packages in order:
 
 1. `game-config-edit-win32-x64`
 2. `game-config-edit-darwin-arm64`
@@ -23,17 +23,8 @@ Publishing is retry-safe only for the same Git commit: rerunning the workflow sk
 
 ## GitHub configuration
 
-The release workflow expects these GitHub Actions secrets:
+The release workflow expects this GitHub Actions secret:
 
 - `NPM_TOKEN`
-- `APPLE_CERTIFICATE_BASE64`
-- `APPLE_CERTIFICATE_PASSWORD`
-- `APPLE_APP_PASSWORD`
 
-The following non-password values may be configured as GitHub Actions variables or secrets:
-
-- `APPLE_SIGNING_IDENTITY`
-- `APPLE_ID`
-- `APPLE_TEAM_ID`
-
-The macOS job must run on an Apple Silicon runner. It signs, notarizes, and staples the app before either native npm package is published.
+The macOS job runs on an Apple Silicon runner and publishes one unsigned `gconf` executable. It does not build an `.app` bundle or perform signing, notarization, or stapling.
