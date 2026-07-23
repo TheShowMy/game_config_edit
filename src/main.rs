@@ -1298,7 +1298,10 @@ fn App() -> Element {
             },
             onmouseup: move |_| resize_drag.set(None),
             header { class: "titlebar",
-                div { class: "brand", {tr(Text::AppTitle)} }
+                div { class: "brand",
+                    span { class: "brand-mark", aria_hidden: "true" }
+                    {tr(Text::AppTitle)}
+                }
                 div { class: "workspace-path", title: "{root_label}", "{root_label}" }
                 div { class: "titlebar-actions",
                     button {
@@ -1308,7 +1311,7 @@ fn App() -> Element {
                         {tr(Text::Shortcuts)}
                     }
                     button {
-                        class: "open-button",
+                        class: "open-button primary",
                         title: tr(Text::OpenFolder),
                         onclick: move |_| {
                             if let Some(path) = choose_workspace() {
@@ -1594,6 +1597,7 @@ fn App() -> Element {
                                             if is_dirty {
                                                 span { class: "dirty-dot", "●" }
                                             }
+                                            span { class: "file-icon", aria_hidden: "true" }
                                             span { class: "file-name", "{entry.file_name}" }
                                             span { class: "file-stats",
                                                 match stats {
