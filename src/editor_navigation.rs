@@ -120,6 +120,7 @@ mod tests {
     ) -> ColumnAnalysis {
         ColumnAnalysis {
             column_type,
+            type_expression: column_type.label().to_owned(),
             problems: problem_rows
                 .iter()
                 .map(|row_index| CellProblem {

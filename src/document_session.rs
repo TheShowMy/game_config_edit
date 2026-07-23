@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::csv_document::{CsvDocument, CsvDocumentError};
+use crate::csv_document::{CsvDocument, CsvDocumentError, CsvEncoding, DelimiterSource};
 use crate::settings::{DEFAULT_HEADER_ROWS, MAX_HEADER_ROWS, MIN_HEADER_ROWS};
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -42,6 +42,7 @@ pub struct DocumentSession {
     saved_hash: blake3::Hash,
     current_hash: blake3::Hash,
     delimiter_override: Option<u8>,
+    gb18030_conversion_allowed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +59,8 @@ pub enum DocumentSessionError {
     },
     #[error("header rows must be between {MIN_HEADER_ROWS} and {MAX_HEADER_ROWS}, got {0}")]
     InvalidHeaderRows(usize),
+    #[error("{path} uses GB18030 and must be converted to UTF-8 before editing")]
+    Gb18030RequiresConversion { path: PathBuf },
 }
 
 impl DocumentSession {
@@ -70,12 +73,60 @@ impl DocumentSession {
         delimiter_override: Option<u8>,
         header_rows: usize,
     ) -> Result<Self, DocumentSessionError> {
+        Self::open_with_conversion(path, delimiter_override, header_rows, false)
+    }
+
+    pub fn open_with_conversion(
+        path: &Path,
+        delimiter_override: Option<u8>,
+        header_rows: usize,
+        convert_gb18030: bool,
+    ) -> Result<Self, DocumentSessionError> {
         validate_header_rows(header_rows)?;
         let bytes = fs::read(path).map_err(|source| CsvDocumentError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_bytes(path, bytes, delimiter_override, header_rows)
+        Self::from_bytes(
+            path,
+            bytes,
+            delimiter_override,
+            header_rows,
+            convert_gb18030,
+        )
+    }
+
+    pub fn from_loaded_document(
+        mut document: CsvDocument,
+        header_rows: usize,
+        convert_gb18030: bool,
+    ) -> Result<Self, DocumentSessionError> {
+        validate_header_rows(header_rows)?;
+        let saved_hash = document.source_hash();
+        if document.encoding == CsvEncoding::Gb18030 {
+            if !convert_gb18030 {
+                return Err(DocumentSessionError::Gb18030RequiresConversion {
+                    path: document.path.clone(),
+                });
+            }
+            document.convert_to_utf8();
+        }
+        let current_hash = blake3::hash(&document.to_bytes());
+        let delimiter_override =
+            (document.delimiter_source == DelimiterSource::Manual).then_some(document.delimiter);
+        Ok(Self {
+            document,
+            header_rows,
+            text_override: None,
+            view: DocumentView::Table,
+            text_parse_issue: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            saved_hash,
+            current_hash,
+            delimiter_override,
+            gb18030_conversion_allowed: convert_gb18030,
+        })
     }
 
     fn from_bytes(
@@ -83,15 +134,25 @@ impl DocumentSession {
         bytes: Vec<u8>,
         delimiter_override: Option<u8>,
         header_rows: usize,
+        convert_gb18030: bool,
     ) -> Result<Self, DocumentSessionError> {
         let saved_hash = blake3::hash(&bytes);
-        let (document, text_override, view, text_parse_issue) =
+        let (mut document, text_override, view, text_parse_issue) =
             match CsvDocument::from_bytes(path, &bytes, delimiter_override) {
                 Ok(document) => (document, None, DocumentView::Table, None),
                 Err(error @ CsvDocumentError::Parse { .. }) => {
                     let error_count = error.parse_error_count().unwrap_or(1);
-                    let (text, has_bom) = decode_utf8(path, &bytes)?;
-                    let placeholder_bytes = if has_bom { UTF8_BOM } else { &[] };
+                    let (text, encoding) = CsvDocument::decode_bytes(path, &bytes)?;
+                    if encoding == CsvEncoding::Gb18030 && !convert_gb18030 {
+                        return Err(DocumentSessionError::Gb18030RequiresConversion {
+                            path: path.to_path_buf(),
+                        });
+                    }
+                    let placeholder_bytes = if encoding == CsvEncoding::Utf8Bom {
+                        UTF8_BOM
+                    } else {
+                        &[]
+                    };
                     let document =
                         CsvDocument::from_bytes(path, placeholder_bytes, delimiter_override)
                             .expect("an empty UTF-8 CSV is always parseable");
@@ -107,6 +168,19 @@ impl DocumentSession {
                 }
                 Err(error) => return Err(error.into()),
             };
+        if document.encoding == CsvEncoding::Gb18030 {
+            if !convert_gb18030 {
+                return Err(DocumentSessionError::Gb18030RequiresConversion {
+                    path: path.to_path_buf(),
+                });
+            }
+            document.convert_to_utf8();
+        }
+        let current_hash = if let Some(text) = text_override.as_deref() {
+            hash_text(document.has_bom, text)
+        } else {
+            blake3::hash(&document.to_bytes())
+        };
         Ok(Self {
             document,
             header_rows,
@@ -116,8 +190,9 @@ impl DocumentSession {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             saved_hash,
-            current_hash: saved_hash,
+            current_hash,
             delimiter_override,
+            gb18030_conversion_allowed: convert_gb18030,
         })
     }
 
@@ -307,6 +382,10 @@ impl DocumentSession {
         self.delimiter_override
     }
 
+    pub fn gb18030_conversion_allowed(&self) -> bool {
+        self.gb18030_conversion_allowed
+    }
+
     pub fn save(&mut self, overwrite_external_changes: bool) -> Result<(), DocumentSessionError> {
         let path = self.document.path.clone();
         if !overwrite_external_changes {
@@ -331,29 +410,19 @@ impl DocumentSession {
             source,
         })?;
         let previous_view = self.view;
-        let mut replacement =
-            Self::from_bytes(&path, bytes, self.delimiter_override, self.header_rows)?;
+        let mut replacement = Self::from_bytes(
+            &path,
+            bytes,
+            self.delimiter_override,
+            self.header_rows,
+            self.gb18030_conversion_allowed,
+        )?;
         if replacement.text_parse_issue.is_none() {
             replacement.view = previous_view;
         }
         *self = replacement;
         Ok(())
     }
-}
-
-fn decode_utf8(path: &Path, bytes: &[u8]) -> Result<(String, bool), CsvDocumentError> {
-    let has_bom = bytes.starts_with(UTF8_BOM);
-    let content = if has_bom {
-        &bytes[UTF8_BOM.len()..]
-    } else {
-        bytes
-    };
-    std::str::from_utf8(content)
-        .map(|text| (text.to_owned(), has_bom))
-        .map_err(|error| CsvDocumentError::InvalidUtf8 {
-            path: path.to_path_buf(),
-            valid_up_to: error.valid_up_to() + usize::from(has_bom) * UTF8_BOM.len(),
-        })
 }
 
 fn hash_text(has_bom: bool, text: &str) -> blake3::Hash {
@@ -414,6 +483,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), DocumentSessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use encoding_rs::GB18030;
 
     fn create_session(content: &[u8]) -> (tempfile::TempDir, PathBuf, DocumentSession) {
         let directory = tempfile::tempdir().unwrap();
@@ -421,6 +491,82 @@ mod tests {
         fs::write(&path, content).unwrap();
         let session = DocumentSession::open(&path, Some(b',')).unwrap();
         (directory, path, session)
+    }
+
+    fn gb18030_bytes(content: &str) -> Vec<u8> {
+        let (bytes, _, had_errors) = GB18030.encode(content);
+        assert!(!had_errors);
+        bytes.into_owned()
+    }
+
+    #[test]
+    fn gb18030_requires_explicit_conversion_before_editing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("heroes.csv");
+        let bytes = gb18030_bytes("id,name\r\n1,亚瑟\r\n");
+        fs::write(&path, &bytes).unwrap();
+
+        let error = DocumentSession::open_with_options(&path, Some(b','), 1).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DocumentSessionError::Gb18030RequiresConversion { .. }
+        ));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn converted_gb18030_session_is_dirty_and_saves_as_utf8_without_bom() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("heroes.csv");
+        let original = gb18030_bytes("id,name\r\n1,亚瑟\r\n");
+        fs::write(&path, &original).unwrap();
+
+        let mut session =
+            DocumentSession::open_with_conversion(&path, Some(b','), 1, true).unwrap();
+
+        assert_eq!(session.document.encoding, CsvEncoding::Utf8);
+        assert_eq!(
+            session.document.line_ending,
+            crate::csv_document::LineEnding::CrLf
+        );
+        assert_eq!(session.saved_hash(), blake3::hash(&original));
+        assert!(session.is_dirty());
+
+        session.save(false).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), "id,name\r\n1,亚瑟\r\n".as_bytes());
+        assert!(!session.is_dirty());
+    }
+
+    #[test]
+    fn converted_gb18030_session_detects_external_modification() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("heroes.csv");
+        fs::write(&path, gb18030_bytes("id,name\n1,亚瑟\n")).unwrap();
+        let mut session =
+            DocumentSession::open_with_conversion(&path, Some(b','), 1, true).unwrap();
+        fs::write(&path, gb18030_bytes("id,name\n1,梅林\n")).unwrap();
+
+        let error = session.save(false).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DocumentSessionError::ExternalModification { .. }
+        ));
+        assert!(session.is_dirty());
+    }
+
+    #[test]
+    fn loaded_gb18030_preview_reuses_original_bytes_as_the_editing_baseline() {
+        let original = gb18030_bytes("id,name\n1,亚瑟\n");
+        let document =
+            CsvDocument::from_bytes(Path::new("heroes.csv"), &original, Some(b',')).unwrap();
+
+        let session = DocumentSession::from_loaded_document(document, 1, true).unwrap();
+
+        assert_eq!(session.saved_hash(), blake3::hash(&original));
+        assert_eq!(session.document.encoding, CsvEncoding::Utf8);
+        assert!(session.is_dirty());
     }
 
     #[test]

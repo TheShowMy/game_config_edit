@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use csv::{ReaderBuilder, StringRecord, Terminator, WriterBuilder};
+use encoding_rs::GB18030;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -20,6 +21,23 @@ struct ParsedRecords {
 pub enum LineEnding {
     Lf,
     CrLf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CsvEncoding {
+    Utf8,
+    Utf8Bom,
+    Gb18030,
+}
+
+impl CsvEncoding {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Utf8Bom => "UTF-8 BOM",
+            Self::Gb18030 => "GB18030",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,11 +108,13 @@ pub struct CsvDocument {
     pub path: PathBuf,
     pub raw_text: String,
     pub has_bom: bool,
+    pub encoding: CsvEncoding,
     pub line_ending: LineEnding,
     pub delimiter: u8,
     pub delimiter_source: DelimiterSource,
     pub records: Arc<Vec<Vec<String>>>,
     record_spans: Arc<Vec<std::ops::Range<usize>>>,
+    source_hash: blake3::Hash,
     analysis_version: u64,
 }
 
@@ -144,18 +164,8 @@ impl CsvDocument {
         bytes: &[u8],
         delimiter_override: Option<u8>,
     ) -> Result<Self, CsvDocumentError> {
-        let has_bom = bytes.starts_with(UTF8_BOM);
-        let content = if has_bom {
-            &bytes[UTF8_BOM.len()..]
-        } else {
-            bytes
-        };
-        let raw_text = std::str::from_utf8(content)
-            .map_err(|error| CsvDocumentError::InvalidUtf8 {
-                path: path.to_path_buf(),
-                valid_up_to: error.valid_up_to() + usize::from(has_bom) * UTF8_BOM.len(),
-            })?
-            .to_owned();
+        let (raw_text, encoding) = Self::decode_bytes(path, bytes)?;
+        let has_bom = encoding == CsvEncoding::Utf8Bom;
         let line_ending = detect_line_ending(&raw_text);
         let (delimiter, delimiter_source) = match delimiter_override {
             Some(delimiter) => (delimiter, DelimiterSource::Manual),
@@ -167,17 +177,30 @@ impl CsvDocument {
             path: path.to_path_buf(),
             raw_text,
             has_bom,
+            encoding,
             line_ending,
             delimiter,
             delimiter_source,
             records: Arc::new(parsed.records),
             record_spans: Arc::new(parsed.spans),
+            source_hash: blake3::hash(bytes),
             analysis_version: next_analysis_version(),
         })
     }
 
     pub fn analysis_version(&self) -> u64 {
         self.analysis_version
+    }
+
+    pub fn source_hash(&self) -> blake3::Hash {
+        self.source_hash
+    }
+
+    pub fn decode_bytes(
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(String, CsvEncoding), CsvDocumentError> {
+        decode_text(path, bytes)
     }
 
     pub fn dimensions(&self, header_rows: usize) -> Option<(usize, usize)> {
@@ -263,13 +286,55 @@ impl CsvDocument {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.raw_text.len() + UTF8_BOM.len());
-        if self.has_bom {
-            bytes.extend_from_slice(UTF8_BOM);
+        match self.encoding {
+            CsvEncoding::Utf8 | CsvEncoding::Utf8Bom => {
+                let mut bytes = Vec::with_capacity(self.raw_text.len() + UTF8_BOM.len());
+                if self.encoding == CsvEncoding::Utf8Bom {
+                    bytes.extend_from_slice(UTF8_BOM);
+                }
+                bytes.extend_from_slice(self.raw_text.as_bytes());
+                bytes
+            }
+            CsvEncoding::Gb18030 => {
+                let (bytes, _, had_errors) = GB18030.encode(&self.raw_text);
+                debug_assert!(!had_errors, "decoded GB18030 text must encode losslessly");
+                bytes.into_owned()
+            }
         }
-        bytes.extend_from_slice(self.raw_text.as_bytes());
-        bytes
     }
+
+    pub fn convert_to_utf8(&mut self) {
+        self.encoding = CsvEncoding::Utf8;
+        self.has_bom = false;
+        self.analysis_version = next_analysis_version();
+    }
+}
+
+fn decode_text(path: &Path, bytes: &[u8]) -> Result<(String, CsvEncoding), CsvDocumentError> {
+    if let Some(content) = bytes.strip_prefix(UTF8_BOM) {
+        return std::str::from_utf8(content)
+            .map(|text| (text.to_owned(), CsvEncoding::Utf8Bom))
+            .map_err(|error| CsvDocumentError::InvalidUtf8 {
+                path: path.to_path_buf(),
+                valid_up_to: error.valid_up_to() + UTF8_BOM.len(),
+            });
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok((text.to_owned(), CsvEncoding::Utf8));
+    }
+
+    let (text, had_errors) = GB18030.decode_without_bom_handling(bytes);
+    if !had_errors {
+        return Ok((text.into_owned(), CsvEncoding::Gb18030));
+    }
+
+    let valid_up_to = std::str::from_utf8(bytes)
+        .expect_err("UTF-8 was checked above")
+        .valid_up_to();
+    Err(CsvDocumentError::InvalidUtf8 {
+        path: path.to_path_buf(),
+        valid_up_to,
+    })
 }
 
 fn parse_records(
@@ -377,12 +442,7 @@ fn validate_quote_syntax(raw_text: &str, delimiter: u8) -> Vec<ParseIssue> {
                 }
             }
             QuoteState::Unquoted => {
-                if byte == b'"' {
-                    issues.push(ParseIssue {
-                        byte: index,
-                        message: format!("unexpected quote in unquoted field at byte {index}"),
-                    });
-                } else if byte == delimiter {
+                if byte == delimiter {
                     state = QuoteState::FieldStart;
                 } else if line_break {
                     state = QuoteState::FieldStart;
@@ -517,10 +577,34 @@ mod tests {
         .unwrap();
 
         assert!(document.has_bom);
+        assert_eq!(document.encoding, CsvEncoding::Utf8Bom);
         assert_eq!(document.line_ending, LineEnding::CrLf);
         assert_eq!(document.delimiter, b',');
         assert_eq!(document.delimiter_source, DelimiterSource::Detected);
         assert_eq!(document.dimensions(1), Some((1, 2)));
+    }
+
+    #[test]
+    fn detects_utf8_without_bom() {
+        let document =
+            CsvDocument::from_bytes(Path::new("heroes.csv"), b"id,name\n1,Arthur\n", None).unwrap();
+
+        assert_eq!(document.encoding, CsvEncoding::Utf8);
+        assert!(!document.has_bom);
+    }
+
+    #[test]
+    fn decodes_gb18030_without_changing_its_original_bytes() {
+        let source = "id,name\r\n1,亚瑟\r\n";
+        let (bytes, _, had_errors) = GB18030.encode(source);
+        assert!(!had_errors);
+
+        let document = CsvDocument::from_bytes(Path::new("heroes.csv"), &bytes, None).unwrap();
+
+        assert_eq!(document.encoding, CsvEncoding::Gb18030);
+        assert_eq!(document.raw_text, source);
+        assert_eq!(document.line_ending, LineEnding::CrLf);
+        assert_eq!(document.to_bytes(), bytes.as_ref());
     }
 
     #[test]
@@ -602,24 +686,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unclosed_and_misplaced_quotes() {
+    fn rejects_unclosed_quotes_and_characters_after_standard_quoted_fields() {
         let unclosed = CsvDocument::from_bytes(
             Path::new("unclosed.csv"),
             b"id,name\n1,\"Arthur\n",
             Some(b','),
         )
         .unwrap_err();
-        let misplaced = CsvDocument::from_bytes(
-            Path::new("misplaced.csv"),
-            b"id,name\n1,Art\"hur\n",
+        let trailing = CsvDocument::from_bytes(
+            Path::new("trailing.csv"),
+            b"id,name\n1,\"Arthur\"x\n",
             Some(b','),
         )
         .unwrap_err();
 
         assert_eq!(unclosed.parse_error_count(), Some(1));
         assert!(unclosed.to_string().contains("unclosed quoted field"));
-        assert_eq!(misplaced.parse_error_count(), Some(1));
-        assert!(misplaced.to_string().contains("unexpected quote"));
+        assert_eq!(trailing.parse_error_count(), Some(1));
+        assert!(trailing.to_string().contains("unexpected character"));
+    }
+
+    #[test]
+    fn preserves_quotes_inside_unquoted_json_fields() {
+        let document = CsvDocument::from_bytes(
+            Path::new("resources.csv"),
+            b"id,data\n1,{\"path\":\"resources/guide/prefab/setNamePopView\"}\n",
+            Some(b','),
+        )
+        .unwrap();
+
+        assert_eq!(
+            document.records[1][1],
+            r#"{"path":"resources/guide/prefab/setNamePopView"}"#
+        );
     }
 
     #[test]

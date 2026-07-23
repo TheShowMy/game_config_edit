@@ -106,6 +106,13 @@ pub enum Text {
     JsonObject,
     JsonArray,
     JsonArray2d,
+    ProblemReasons,
+    CellValue,
+    ProblemRealLineBreak,
+    ProblemDangerousInvisibleCharacter,
+    ProblemUnescapedQuote,
+    ProblemInvalidBackslashEscape,
+    MixedTypeReason,
     UnsavedFiles,
     SaveAll,
     DontSave,
@@ -119,6 +126,8 @@ pub enum Text {
     ReloadDiskFile,
     DiscardLocalTitle,
     DiscardAndReload,
+    ConvertEncodingTitle,
+    ConvertToUtf8,
     ShortcutGlobal,
     ShortcutFileSearch,
     ShortcutTableNavigation,
@@ -146,7 +155,7 @@ pub enum Text {
     ShortcutRedo,
     ShortcutCommitDown,
     ShortcutCommitAcross,
-    ShortcutCommitJson,
+    ShortcutInsertLineBreak,
     ShortcutIndentJson,
     ShortcutCancelEdit,
     TabLimit,
@@ -265,6 +274,28 @@ impl Text {
             Self::JsonObject => ("JSON 对象", "JSON object"),
             Self::JsonArray => ("一维 JSON 数组", "one-dimensional JSON array"),
             Self::JsonArray2d => ("二维 JSON 数组", "two-dimensional JSON array"),
+            Self::ProblemReasons => ("问题原因", "Problem reasons"),
+            Self::CellValue => ("单元格值", "Cell value"),
+            Self::ProblemRealLineBreak => (
+                "包含真实换行控制字符（CR/LF）",
+                "Contains a real line-break control character (CR/LF)",
+            ),
+            Self::ProblemDangerousInvisibleCharacter => (
+                "包含危险的不可见字符",
+                "Contains a dangerous invisible character",
+            ),
+            Self::ProblemUnescapedQuote => (
+                "普通字符串包含未转义的双引号",
+                "Plain string contains an unescaped double quote",
+            ),
+            Self::ProblemInvalidBackslashEscape => (
+                "普通字符串包含非法反斜杠转义",
+                "Plain string contains an invalid backslash escape",
+            ),
+            Self::MixedTypeReason => (
+                "该列包含不兼容的基础类型，已判定为 mixed",
+                "This column contains incompatible primitive types and is classified as mixed",
+            ),
             Self::UnsavedFiles => ("未保存的文件", "Unsaved files"),
             Self::SaveAll => ("全部保存", "Save all"),
             Self::DontSave => ("不保存", "Don't save"),
@@ -278,6 +309,8 @@ impl Text {
             Self::ReloadDiskFile => ("重新加载磁盘文件", "Reload disk file"),
             Self::DiscardLocalTitle => ("放弃本地更改？", "Discard local changes?"),
             Self::DiscardAndReload => ("放弃并重新加载", "Discard and reload"),
+            Self::ConvertEncodingTitle => ("转换 CSV 编码？", "Convert CSV encoding?"),
+            Self::ConvertToUtf8 => ("转换为 UTF-8", "Convert to UTF-8"),
             Self::ShortcutGlobal => ("全局", "Global"),
             Self::ShortcutFileSearch => ("文件与搜索", "Files and search"),
             Self::ShortcutTableNavigation => ("表格导航", "Table navigation"),
@@ -308,7 +341,7 @@ impl Text {
             Self::ShortcutRedo => ("重做", "Redo"),
             Self::ShortcutCommitDown => ("提交并移动到下一行", "Commit and move down"),
             Self::ShortcutCommitAcross => ("提交并横向移动", "Commit and move across"),
-            Self::ShortcutCommitJson => ("提交 JSON 编辑", "Commit JSON edit"),
+            Self::ShortcutInsertLineBreak => ("插入换行", "Insert a line break"),
             Self::ShortcutIndentJson => ("在 JSON 中缩进", "Indent JSON"),
             Self::ShortcutCancelEdit => ("取消编辑", "Cancel edit"),
             Self::TabLimit => (
@@ -383,30 +416,85 @@ pub enum Message<'a> {
     KeptLocal(&'a str),
     ExternalConflict(&'a str),
     ExternalReloaded(&'a str),
-    ReloadFailed { file: &'a str, detail: &'a str },
+    ReloadFailed {
+        file: &'a str,
+        detail: &'a str,
+    },
     DiskParseFailed(&'a str),
     Revealed(&'a str),
-    RevealFailed { file: &'a str, detail: &'a str },
-    TableAnalysisFailed { file: &'a str, detail: &'a str },
-    MatchPosition { current: usize, total: usize },
-    LineOutOfFile { line: usize, lines: usize },
-    RowOutOfTable { row: usize, rows: usize },
-    RowOutOfPreview { row: usize, rows: usize },
-    ProblemAt { row: usize, column: usize },
+    RevealFailed {
+        file: &'a str,
+        detail: &'a str,
+    },
+    TableAnalysisFailed {
+        file: &'a str,
+        detail: &'a str,
+    },
+    MatchPosition {
+        current: usize,
+        total: usize,
+    },
+    LineOutOfFile {
+        line: usize,
+        lines: usize,
+    },
+    RowOutOfTable {
+        row: usize,
+        rows: usize,
+    },
+    RowOutOfPreview {
+        row: usize,
+        rows: usize,
+    },
+    ProblemAt {
+        row: usize,
+        column: usize,
+    },
     MixedColumn(usize),
-    HeaderRange { minimum: usize, maximum: usize },
+    FocusMode {
+        column: usize,
+        field: Option<&'a str>,
+    },
+    FocusModeTooltip {
+        column: usize,
+        field: Option<&'a str>,
+    },
+    HeaderRange {
+        minimum: usize,
+        maximum: usize,
+    },
     InvalidHeaderRecords(usize),
-    RowsColumns { rows: usize, columns: usize },
+    RowsColumns {
+        rows: usize,
+        columns: usize,
+    },
     RequiresHeaderRows(usize),
-    TablePosition { row: usize, column: usize },
-    TextPosition { line: usize, column: usize },
-    UnsavedFiles { count: usize, action: CloseAction },
+    TablePosition {
+        row: usize,
+        column: usize,
+    },
+    TextPosition {
+        line: usize,
+        column: usize,
+    },
+    UnsavedFiles {
+        count: usize,
+        action: CloseAction,
+    },
     SaveChanges(&'a str),
     ReloadDiscard(&'a str),
+    ConvertGb18030(&'a str),
     FileChanged(&'a str),
-    SaveParseProblems { count: usize, detail: &'a str },
+    SaveParseProblems {
+        count: usize,
+        detail: &'a str,
+    },
     SaveCellProblems(usize),
-    Technical { prefix: Text, detail: &'a str },
+    StructuralMismatch(&'a str),
+    Technical {
+        prefix: Text,
+        detail: &'a str,
+    },
 }
 
 pub fn message(value: Message<'_>) -> String {
@@ -549,6 +637,24 @@ pub fn message_for(language: Language, value: Message<'_>) -> String {
                 format!("Mixed types in column {column}")
             }
         }
+        Message::FocusMode { column, field } => match (zh, field) {
+            (true, Some(field)) => format!("聚焦模式 · 第 {column} 列 · {field}"),
+            (true, None) => format!("聚焦模式 · 第 {column} 列"),
+            (false, Some(field)) => format!("Focus mode · Column {column} · {field}"),
+            (false, None) => format!("Focus mode · Column {column}"),
+        },
+        Message::FocusModeTooltip { column, field } => match (zh, field) {
+            (true, Some(field)) => {
+                format!("聚焦模式已开启：第 {column} 列（字段：{field}）。按 T 或 Esc 退出。")
+            }
+            (true, None) => format!("聚焦模式已开启：第 {column} 列。按 T 或 Esc 退出。"),
+            (false, Some(field)) => format!(
+                "Focus mode is active on column {column} (field: {field}). Press T or Esc to exit."
+            ),
+            (false, None) => {
+                format!("Focus mode is active on column {column}. Press T or Esc to exit.")
+            }
+        },
         Message::HeaderRange { minimum, maximum } => {
             if zh {
                 format!("表头行数必须在 {minimum} 到 {maximum} 之间")
@@ -619,6 +725,17 @@ pub fn message_for(language: Language, value: Message<'_>) -> String {
                 format!("Reloading {file} will permanently discard all unsaved edits in this tab.")
             }
         }
+        Message::ConvertGb18030(file) => {
+            if zh {
+                format!(
+                    "{file} 使用 GB18030 编码。编辑前需要在内存中转换为 UTF-8；文件会在保存时才写为无 BOM UTF-8。是否继续？"
+                )
+            } else {
+                format!(
+                    "{file} uses GB18030. Editing requires an in-memory UTF-8 conversion; the file will only be written as UTF-8 without BOM when you save. Continue?"
+                )
+            }
+        }
         Message::FileChanged(file) => {
             if zh {
                 format!("{file} 在打开后已被更改。要覆盖磁盘文件、重新加载还是取消？")
@@ -646,6 +763,13 @@ pub fn message_for(language: Language, value: Message<'_>) -> String {
                 format!(
                     "This file contains {count} cells with red compatibility or structure problems."
                 )
+            }
+        }
+        Message::StructuralMismatch(expected) => {
+            if zh {
+                format!("与该列推断出的 {expected} 结构不匹配")
+            } else {
+                format!("Does not match the column's inferred {expected} structure")
             }
         }
         Message::Technical { prefix, detail } => format!("{}: {detail}", language.text(prefix)),
@@ -797,7 +921,7 @@ pub const SHORTCUTS: &[ShortcutEntry] = &[
     ShortcutEntry {
         group: ShortcutGroup::Editing,
         keys: "PRIMARY+Enter",
-        description: Text::ShortcutCommitJson,
+        description: Text::ShortcutInsertLineBreak,
     },
     ShortcutEntry {
         group: ShortcutGroup::Editing,
@@ -917,6 +1041,14 @@ mod tests {
         assert_eq!(Language::Zh.text(Text::TypeLabel), "类型");
         assert_eq!(Language::Zh.text(Text::JsonArray2d), "二维 JSON 数组");
         assert_eq!(
+            Language::Zh.text(Text::ProblemUnescapedQuote),
+            "普通字符串包含未转义的双引号"
+        );
+        assert_eq!(
+            Language::En.text(Text::ShortcutInsertLineBreak),
+            "Insert a line break"
+        );
+        assert_eq!(
             Language::En.text(Text::PositiveLineAfterColon),
             "Enter a positive line number after ':'"
         );
@@ -950,6 +1082,40 @@ mod tests {
         assert_eq!(
             message_for(Language::Zh, Message::TablePosition { row: 2, column: 4 }),
             "第 2 行，第 4 列"
+        );
+        assert_eq!(
+            message_for(Language::En, Message::StructuralMismatch("json")),
+            "Does not match the column's inferred json structure"
+        );
+        assert_eq!(
+            message_for(
+                Language::Zh,
+                Message::FocusMode {
+                    column: 3,
+                    field: Some("name")
+                }
+            ),
+            "聚焦模式 · 第 3 列 · name"
+        );
+        assert_eq!(
+            message_for(
+                Language::En,
+                Message::FocusMode {
+                    column: 2,
+                    field: None
+                }
+            ),
+            "Focus mode · Column 2"
+        );
+        assert!(
+            message_for(
+                Language::Zh,
+                Message::FocusModeTooltip {
+                    column: 1,
+                    field: Some("id")
+                }
+            )
+            .contains("按 T 或 Esc 退出")
         );
     }
 }

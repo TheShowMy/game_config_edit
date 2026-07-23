@@ -1,7 +1,6 @@
 use std::ops::Range;
 
 pub const DATA_ROW_HEIGHT: f64 = 30.0;
-pub const FOCUS_DATA_ROW_HEIGHT: f64 = 108.0;
 pub const DEFAULT_VIEWPORT_HEIGHT: f64 = 900.0;
 pub const DEFAULT_VIEWPORT_WIDTH: f64 = 1280.0;
 pub const OVERSCAN_ROWS: usize = 8;
@@ -13,6 +12,7 @@ pub struct TableViewport {
     pub scroll_top: f64,
     pub height: f64,
     pub width: f64,
+    pub expanded_row: Option<ExpandedRow>,
 }
 
 impl Default for TableViewport {
@@ -21,6 +21,51 @@ impl Default for TableViewport {
             scroll_top: 0.0,
             height: DEFAULT_VIEWPORT_HEIGHT,
             width: DEFAULT_VIEWPORT_WIDTH,
+            expanded_row: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpandedRow {
+    pub index: usize,
+    pub column_index: usize,
+    pub height: f64,
+}
+
+impl ExpandedRow {
+    pub fn measured(
+        index: usize,
+        column_index: usize,
+        content_height: f64,
+        viewport_height: f64,
+    ) -> Self {
+        let maximum = if viewport_height.is_finite() && viewport_height > 0.0 {
+            (viewport_height / 3.0).max(DATA_ROW_HEIGHT)
+        } else {
+            DEFAULT_VIEWPORT_HEIGHT / 3.0
+        };
+        let height = if content_height.is_finite() {
+            content_height.clamp(DATA_ROW_HEIGHT, maximum)
+        } else {
+            DATA_ROW_HEIGHT
+        };
+        Self {
+            index,
+            column_index,
+            height,
+        }
+    }
+
+    pub const fn matches_cell(self, index: usize, column_index: usize) -> bool {
+        self.index == index && self.column_index == column_index
+    }
+
+    fn extra_height(self, row_count: usize) -> f64 {
+        if self.index < row_count {
+            (self.height - DATA_ROW_HEIGHT).max(0.0)
+        } else {
+            0.0
         }
     }
 }
@@ -138,14 +183,6 @@ impl FocusLayout {
 }
 
 pub fn visible_row_range(row_count: usize, viewport: TableViewport) -> Range<usize> {
-    visible_row_range_with_height(row_count, viewport, DATA_ROW_HEIGHT)
-}
-
-pub fn visible_row_range_with_height(
-    row_count: usize,
-    viewport: TableViewport,
-    row_height: f64,
-) -> Range<usize> {
     if row_count == 0 {
         return 0..0;
     }
@@ -160,39 +197,67 @@ pub fn visible_row_range_with_height(
     } else {
         DEFAULT_VIEWPORT_HEIGHT
     };
-    let row_height = if row_height.is_finite() && row_height > 0.0 {
-        row_height
-    } else {
-        DATA_ROW_HEIGHT
-    };
-    let first_visible = (scroll_top / row_height).floor() as usize;
-    let visible_count = (height / row_height).ceil() as usize + 1;
+    let expanded_row = viewport.expanded_row.filter(|row| row.index < row_count);
+    if scroll_top >= row_offset(row_count, row_count, expanded_row) {
+        return row_count..row_count;
+    }
+    let first_visible = row_at_offset(row_count, scroll_top, expanded_row);
+    let last_visible = row_at_offset(row_count, scroll_top + height, expanded_row);
     let start = first_visible.saturating_sub(OVERSCAN_ROWS).min(row_count);
-    let end = first_visible
-        .saturating_add(visible_count)
+    let end = last_visible
+        .saturating_add(1)
         .saturating_add(OVERSCAN_ROWS)
         .min(row_count);
 
     start..end.max(start)
 }
 
-pub fn spacer_heights(row_count: usize, range: &Range<usize>) -> (f64, f64) {
-    spacer_heights_with_height(row_count, range, DATA_ROW_HEIGHT)
-}
-
-pub fn spacer_heights_with_height(
+pub fn spacer_heights(
     row_count: usize,
     range: &Range<usize>,
-    row_height: f64,
+    expanded_row: Option<ExpandedRow>,
 ) -> (f64, f64) {
-    let row_height = if row_height.is_finite() && row_height > 0.0 {
-        row_height
-    } else {
-        DATA_ROW_HEIGHT
-    };
-    let top = range.start.min(row_count) as f64 * row_height;
-    let bottom = row_count.saturating_sub(range.end.min(row_count)) as f64 * row_height;
+    let expanded_row = expanded_row.filter(|row| row.index < row_count);
+    let top = row_offset(range.start.min(row_count), row_count, expanded_row);
+    let total = row_offset(row_count, row_count, expanded_row);
+    let bottom = total - row_offset(range.end.min(row_count), row_count, expanded_row);
     (top, bottom)
+}
+
+pub fn row_offset(row_index: usize, row_count: usize, expanded_row: Option<ExpandedRow>) -> f64 {
+    let row_index = row_index.min(row_count);
+    let extra = expanded_row
+        .filter(|row| row.index < row_index)
+        .map_or(0.0, |row| row.extra_height(row_count));
+    row_index as f64 * DATA_ROW_HEIGHT + extra
+}
+
+fn row_at_offset(row_count: usize, offset: f64, expanded_row: Option<ExpandedRow>) -> usize {
+    if row_count == 0 {
+        return 0;
+    }
+    let offset = if offset.is_finite() {
+        offset.max(0.0)
+    } else {
+        0.0
+    };
+    let Some(expanded) = expanded_row else {
+        return ((offset / DATA_ROW_HEIGHT).floor() as usize).min(row_count);
+    };
+    let expanded_start = expanded.index as f64 * DATA_ROW_HEIGHT;
+    if offset < expanded_start {
+        return ((offset / DATA_ROW_HEIGHT).floor() as usize).min(row_count);
+    }
+    if offset < expanded_start + expanded.height {
+        return expanded.index;
+    }
+    let rows_after =
+        ((offset - expanded_start - expanded.height) / DATA_ROW_HEIGHT).floor() as usize;
+    expanded
+        .index
+        .saturating_add(1)
+        .saturating_add(rows_after)
+        .min(row_count)
 }
 
 #[cfg(test)]
@@ -204,7 +269,7 @@ mod tests {
         let range = visible_row_range(12, TableViewport::default());
 
         assert_eq!(range, 0..12);
-        assert_eq!(spacer_heights(12, &range), (0.0, 0.0));
+        assert_eq!(spacer_heights(12, &range, None), (0.0, 0.0));
     }
 
     #[test]
@@ -219,7 +284,10 @@ mod tests {
         );
 
         assert_eq!(range, 992..1029);
-        assert_eq!(spacer_heights(500_000, &range), (29_760.0, 14_969_130.0));
+        assert_eq!(
+            spacer_heights(500_000, &range, None),
+            (29_760.0, 14_969_130.0)
+        );
     }
 
     #[test]
@@ -234,7 +302,7 @@ mod tests {
         );
 
         assert_eq!(range, 100..100);
-        assert_eq!(spacer_heights(100, &range), (3_000.0, 0.0));
+        assert_eq!(spacer_heights(100, &range, None), (3_000.0, 0.0));
     }
 
     #[test]
@@ -253,19 +321,69 @@ mod tests {
     }
 
     #[test]
-    fn focused_rows_use_their_expanded_height_for_windowing() {
-        let viewport = TableViewport {
-            scroll_top: 10_800.0,
-            height: 540.0,
-            ..TableViewport::default()
-        };
-        let range = visible_row_range_with_height(10_000, viewport, FOCUS_DATA_ROW_HEIGHT);
+    fn measured_row_height_keeps_short_content_at_the_base_height_and_caps_long_content() {
+        assert_eq!(ExpandedRow::measured(4, 2, 18.0, 600.0).height, 30.0);
+        assert_eq!(ExpandedRow::measured(4, 2, 120.0, 600.0).height, 120.0);
+        assert_eq!(ExpandedRow::measured(4, 2, 900.0, 600.0).height, 200.0);
+        assert_eq!(ExpandedRow::measured(4, 2, f64::NAN, 600.0).height, 30.0);
+        assert_eq!(ExpandedRow::measured(4, 2, 900.0, f64::NAN).height, 300.0);
+    }
 
-        assert_eq!(range, 92..114);
-        assert_eq!(
-            spacer_heights_with_height(10_000, &range, FOCUS_DATA_ROW_HEIGHT),
-            (9_936.0, 1_067_688.0)
+    #[test]
+    fn expanded_row_identity_includes_the_focused_column() {
+        let expanded = ExpandedRow::measured(4, 2, 120.0, 600.0);
+
+        assert!(expanded.matches_cell(4, 2));
+        assert!(!expanded.matches_cell(4, 3));
+        assert!(!expanded.matches_cell(5, 2));
+    }
+
+    #[test]
+    fn a_single_expanded_row_changes_offsets_only_after_that_row() {
+        let expanded = Some(ExpandedRow::measured(10, 2, 120.0, 900.0));
+
+        assert_eq!(row_offset(5, 100, expanded), 150.0);
+        assert_eq!(row_offset(10, 100, expanded), 300.0);
+        assert_eq!(row_offset(11, 100, expanded), 420.0);
+        assert_eq!(row_offset(100, 100, expanded), 3_090.0);
+    }
+
+    #[test]
+    fn expanded_row_windowing_and_spacers_work_before_inside_and_after_the_row() {
+        let expanded = Some(ExpandedRow::measured(50, 2, 180.0, 900.0));
+
+        let before = visible_row_range(
+            200,
+            TableViewport {
+                scroll_top: 900.0,
+                height: 300.0,
+                expanded_row: expanded,
+                ..TableViewport::default()
+            },
         );
+        let inside = visible_row_range(
+            200,
+            TableViewport {
+                scroll_top: 1_520.0,
+                height: 100.0,
+                expanded_row: expanded,
+                ..TableViewport::default()
+            },
+        );
+        let after = visible_row_range(
+            200,
+            TableViewport {
+                scroll_top: 2_250.0,
+                height: 300.0,
+                expanded_row: expanded,
+                ..TableViewport::default()
+            },
+        );
+
+        assert_eq!(before, 22..49);
+        assert_eq!(inside, 42..59);
+        assert_eq!(after, 62..89);
+        assert_eq!(spacer_heights(200, &inside, expanded), (1_260.0, 4_230.0));
     }
 
     #[test]

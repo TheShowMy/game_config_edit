@@ -490,6 +490,20 @@ input {
   color: #8f99a8;
 }
 
+.preview-header .focus-mode-status {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 2px 7px;
+  border-left: 3px solid #88a8c4;
+  background: #293a43;
+  color: #d6e5ee;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .text-view {
   display: flex;
   flex: 1;
@@ -671,6 +685,21 @@ input {
   outline-offset: -2px;
 }
 
+.csv-table.focus-table thead .field-header th.focus-column,
+.csv-table.focus-table thead .type-row th.focus-column {
+  background: #293f4a;
+  color: #d6e5ee;
+  box-shadow: inset 2px 0 #88a8c4, inset -2px 0 #88a8c4;
+}
+
+.csv-table.focus-table thead .type-row th.type-error.focus-column {
+  background: #543b42;
+}
+
+.csv-table.focus-table thead .type-row th.type-warning.focus-column {
+  background: #514a37;
+}
+
 .csv-table td:hover {
   background: #252b32;
 }
@@ -701,18 +730,24 @@ input {
   background: #11151b;
 }
 
-.focus-table tbody tr:not(.virtual-spacer) > th,
-.focus-table tbody tr:not(.virtual-spacer) > td {
-  height: 108px;
+.focus-table tbody tr.focus-expanded-row,
+.focus-table tbody tr.focus-expanded-row > th,
+.focus-table tbody tr.focus-expanded-row > td {
+  height: var(--focused-row-height);
+  max-height: var(--focused-row-height);
 }
 
-.focus-table td.focus-column .cell-button {
-  display: -webkit-box;
-  max-height: 96px;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 6;
-  text-overflow: ellipsis;
+.focus-table td.focus-column.cell-selected .cell-button,
+.focus-table td.focus-column.cell-selected .cell-input,
+.focus-table td.focus-column.cell-selected .json-editor {
+  display: block;
+  height: calc(var(--focused-row-height, 30px) - 10px);
+  max-height: calc(var(--focused-row-height, 30px) - 10px);
+  overflow: auto;
+}
+
+.focus-table td.focus-column.cell-selected .cell-button,
+.focus-table td.focus-column.cell-selected .focus-textarea {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -745,6 +780,10 @@ input {
 
 .cell-input {
   min-width: 100px;
+}
+
+.focus-textarea {
+  resize: none;
 }
 
 .json-editor {
@@ -841,6 +880,14 @@ input {
 
 .status-error {
   color: #bf616a;
+}
+
+.status-diagnostic {
+  min-width: 0;
+  max-width: 42vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .overlay-backdrop {
