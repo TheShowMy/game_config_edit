@@ -11,7 +11,10 @@ use dioxus::desktop::WindowCloseBehaviour;
 use dioxus::desktop::tao::event::{Event as WryEvent, WindowEvent};
 use dioxus::prelude::*;
 use game_config_edit::csv_document::{CsvDelimiter, CsvDocument, CsvEncoding, DelimiterSource};
-use game_config_edit::diagnostics::{CellProblemKind, ColumnAnalysis, analyze_table};
+use game_config_edit::diagnostics::{
+    CellProblemDetail, CellProblemKind, ColumnAnalysis, ProblemSeverity, TableKind, analyze_table,
+    effective_header_rows, table_kind,
+};
 use game_config_edit::document_session::{
     DocumentSession, DocumentSessionError, DocumentView, TextParseIssue,
 };
@@ -47,12 +50,47 @@ use serde::Deserialize;
 
 const APP_CSS: &str = include_str!("app.css");
 const RESTORE_TABLE_SCROLL_JS: &str = r#"
-            const restoreTableScroll = (table) => {
-                const desiredScrollTop = Number.parseFloat(table.dataset.scrollTop ?? "");
-                if (!Number.isFinite(desiredScrollTop) || desiredScrollTop <= 0) return;
-                if (Math.abs(table.scrollTop - desiredScrollTop) > 0.5) {
-                    table.scrollTop = desiredScrollTop;
+            const restoreTableScroll = (
+                table,
+                expectedPath = table.dataset.path ?? "",
+                expectedScrollTop = table.dataset.scrollTop ?? "",
+                synchronizeClamped = false,
+            ) => {
+                if (!table.isConnected
+                    || (table.dataset.path ?? "") !== expectedPath
+                    || (table.dataset.scrollTop ?? "") !== expectedScrollTop) return;
+                const desiredScrollTop = Number.parseFloat(expectedScrollTop);
+                if (!Number.isFinite(desiredScrollTop) || desiredScrollTop < 0) return;
+                const maximumScrollTop = Math.max(0, table.scrollHeight - table.clientHeight);
+                const targetScrollTop = Math.min(desiredScrollTop, maximumScrollTop);
+                if (Math.abs(table.scrollTop - targetScrollTop) > 0.5) {
+                    table.scrollTop = targetScrollTop;
                 }
+                if (synchronizeClamped
+                    && Math.abs(table.scrollTop - desiredScrollTop) > 0.5) {
+                    dioxus.send({table_scroll: {
+                        path: expectedPath,
+                        scroll_top: table.scrollTop,
+                    }});
+                }
+            };
+            const scheduleTableScrollRestore = (table) => {
+                const expectedPath = table.dataset.path ?? "";
+                const expectedScrollTop = table.dataset.scrollTop ?? "";
+                const desiredScrollTop = Number.parseFloat(expectedScrollTop);
+                if (!Number.isFinite(desiredScrollTop)
+                    || desiredScrollTop < 0
+                    || Math.abs(table.scrollTop - desiredScrollTop) <= 0.5) return;
+                const scheduledScrollTop = table.scrollTop;
+                window.requestAnimationFrame(() => {
+                    if (Math.abs(table.scrollTop - scheduledScrollTop) > 0.5) return;
+                    restoreTableScroll(table, expectedPath, expectedScrollTop, false);
+                    const restoredScrollTop = table.scrollTop;
+                    window.requestAnimationFrame(() => {
+                        if (Math.abs(table.scrollTop - restoredScrollTop) > 0.5) return;
+                        restoreTableScroll(table, expectedPath, expectedScrollTop, true);
+                    });
+                });
             };
 "#;
 const HEADER_ROW_HEIGHT: usize = 28;
@@ -235,7 +273,9 @@ struct DocumentStatus {
     encoding: &'static str,
     position: Option<String>,
     diagnostic: Option<String>,
+    diagnostic_severity: Option<ProblemSeverity>,
     red_cells: Option<usize>,
+    yellow_cells: Option<usize>,
     yellow_columns: Option<usize>,
     parse_errors: Option<usize>,
     analysis_loading: bool,
@@ -370,13 +410,26 @@ fn main() {
     let cli = Cli::parse();
     let bootstrap = build_bootstrap(cli.workspace);
     let _ = BOOTSTRAP.set(bootstrap);
-    dioxus::LaunchBuilder::new()
-        .with_cfg(
-            dioxus::desktop::Config::new()
-                .with_menu(None::<dioxus::desktop::muda::Menu>)
-                .with_close_behaviour(WindowCloseBehaviour::WindowHides),
-        )
-        .launch(App);
+    let config = dioxus::desktop::Config::new()
+        .with_menu(None::<dioxus::desktop::muda::Menu>)
+        .with_close_behaviour(WindowCloseBehaviour::WindowHides);
+    #[cfg(target_os = "macos")]
+    let config = config.with_on_window(|_, _| set_macos_application_icon());
+    dioxus::LaunchBuilder::new().with_cfg(config).launch(App);
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_application_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let data = NSData::with_bytes(include_bytes!("../packaging/assets/app-icon.png"));
+    let image = NSImage::initWithData(NSImage::alloc(), &data)
+        .expect("embedded application icon must be a valid PNG");
+    let main_thread = MainThreadMarker::new().expect("application window must run on main thread");
+    let application = NSApplication::sharedApplication(main_thread);
+    unsafe { application.setApplicationIconImage(Some(&image)) };
 }
 
 fn build_bootstrap(explicit_workspace: Option<PathBuf>) -> Bootstrap {
@@ -743,10 +796,14 @@ fn App() -> Element {
                     if preview_path(&preview.peek()) == Some(path.as_path()) {
                         let file_name = file_name(&path);
                         preview.set(match result {
-                            Ok(Ok(document)) => Preview::Document {
-                                document,
-                                header_rows,
-                            },
+                            Ok(Ok(document)) => {
+                                let header_rows =
+                                    effective_header_rows(&document.records, header_rows);
+                                Preview::Document {
+                                    document,
+                                    header_rows,
+                                }
+                            }
                             Ok(Err(error)) => Preview::Error {
                                 path,
                                 file_name,
@@ -1034,7 +1091,16 @@ fn App() -> Element {
                 if (!Number.isFinite(rowIndex) || !Number.isFinite(columnIndex)) return;
                 let contentHeight;
                 if (sharedContent) {
-                    contentHeight = Math.max(30, sharedContent.scrollHeight + 10);
+                    const jsonScroller = cell.querySelector(".json-input")
+                        ?? sharedContent.closest(".focused-json-surface");
+                    const horizontalScrollbarHeight = jsonScroller instanceof HTMLElement
+                        && jsonScroller.scrollWidth > jsonScroller.clientWidth + 1
+                        ? Math.max(0, jsonScroller.offsetHeight - jsonScroller.clientHeight)
+                        : 0;
+                    contentHeight = Math.max(
+                        30,
+                        Math.ceil(sharedContent.scrollHeight + horizontalScrollbarHeight + 10),
+                    );
                 } else {
                     const previousHeight = content.style.height;
                     const previousMaxHeight = content.style.maxHeight;
@@ -1060,7 +1126,6 @@ fn App() -> Element {
                 window.requestAnimationFrame(() => {
                     pendingTableSizes.delete(table);
                     if (!table.isConnected) return;
-                    restoreTableScroll(table);
                     const width = table.clientWidth;
                     const height = table.clientHeight;
                     const previous = lastTableSizes.get(table);
@@ -1088,7 +1153,7 @@ fn App() -> Element {
                 for (const table of tables) {
                     if (observedTables.has(table)) continue;
                     observedTables.add(table);
-                    restoreTableScroll(table);
+                    scheduleTableScrollRestore(table);
                     resizeObserver.observe(table);
                     sendTableSize(table);
                 }
@@ -1110,6 +1175,13 @@ fn App() -> Element {
                 let measureFocused = false;
                 for (const mutation of mutations) {
                     if (mutation.type === "attributes") {
+                        if (mutation.target instanceof HTMLElement
+                            && mutation.target.matches(".table-scroll[data-path]")
+                            && mutation.attributeName === "data-path") {
+                            scheduleTableScrollRestore(mutation.target);
+                            sendTableSize(mutation.target);
+                            continue;
+                        }
                         measureFocused ||= mutation.target instanceof Element
                             && mutation.target.matches("td.focus-column, td.cell-selected");
                         continue;
@@ -1151,7 +1223,7 @@ fn App() -> Element {
                 childList: true,
                 subtree: true,
                 attributes: true,
-                attributeFilter: ["class"],
+                attributeFilter: ["class", "data-path"],
             });
             await new Promise(() => {});
             "#,
@@ -1603,10 +1675,16 @@ fn App() -> Element {
                                                     return;
                                                 }
                                                 preview.set(match result {
-                                                    Ok(Ok(document)) => Preview::Document {
-                                                        document,
-                                                        header_rows: preferences.header_rows,
-                                                    },
+                                                    Ok(Ok(document)) => {
+                                                        let header_rows = effective_header_rows(
+                                                            &document.records,
+                                                            preferences.header_rows,
+                                                        );
+                                                        Preview::Document {
+                                                            document,
+                                                            header_rows,
+                                                        }
+                                                    }
                                                     Ok(Err(error)) => Preview::Error {
                                                         path: path.clone(),
                                                         file_name,
@@ -1815,13 +1893,20 @@ fn App() -> Element {
                         if let Some(red_cells) = status.red_cells {
                             span { class: if red_cells > 0 { "status-error" } else { "" }, {count(Count::RedCells, red_cells)} }
                         }
+                        if let Some(yellow_cells) = status.yellow_cells {
+                            span { class: if yellow_cells > 0 { "status-warning" } else { "" }, {count(Count::YellowCells, yellow_cells)} }
+                        }
                         if let Some(yellow_columns) = status.yellow_columns {
                             span { class: if yellow_columns > 0 { "status-warning" } else { "" }, {count(Count::YellowColumns, yellow_columns)} }
                         }
                     }
                     if let Some(diagnostic) = status.diagnostic {
                         span {
-                            class: "status-diagnostic status-error",
+                            class: if status.diagnostic_severity == Some(ProblemSeverity::Warning) {
+                                "status-diagnostic status-warning"
+                            } else {
+                                "status-diagnostic status-error"
+                            },
                             title: "{diagnostic}",
                             "{diagnostic}"
                         }
@@ -2847,6 +2932,9 @@ fn render_csv_document(
     notice: Signal<Option<String>>,
     preview_edit_context: Option<PreviewEditContext>,
 ) -> Element {
+    let table_kind = table_kind(&document.records);
+    let is_misc_table = table_kind == TableKind::Misc;
+    let header_rows = effective_header_rows(&document.records, header_rows);
     let path = document.path.clone();
     let title = path
         .file_name()
@@ -2936,6 +3024,7 @@ fn render_csv_document(
     let visible_count = visible_range.len();
     let column_count = data_column_count + 1;
     let scroll_path = path.clone();
+    let table_key = path.to_string_lossy().into_owned();
     let scroll_active_tab = preview_edit_context
         .as_ref()
         .map(|context| context.active_tab);
@@ -3076,6 +3165,8 @@ fn render_csv_document(
                     span { {tr(Text::HeaderRows)} }
                     select {
                         aria_label: tr(Text::HeaderRows),
+                        title: if is_misc_table { tr(Text::MiscHeaderRowsFixed) } else { tr(Text::HeaderRows) },
+                        disabled: is_misc_table,
                         value: "{header_rows}",
                         onchange: move |event| {
                             if let Ok(rows) = event.value().parse::<usize>() {
@@ -3215,6 +3306,7 @@ fn render_csv_document(
             }
         } else {
             div {
+                key: "{table_key}",
                 class: "table-scroll",
                 tabindex: "0",
                 "data-path": "{path.to_string_lossy()}",
@@ -3349,6 +3441,7 @@ fn render_csv_document(
                                 }
                             }
                         }
+                        if should_render_type_row(table_kind) {
                         tr { class: "type-row", style: "--type-top: {type_row_top}px",
                             th { class: "row-number", {tr(Text::TypeLabel)} }
                             if left_spacer_width > 0 {
@@ -3357,13 +3450,14 @@ fn render_csv_document(
                             if let Some(analyses) = analyses.as_deref() {
                                 for (column_index, analysis) in analyses.iter().enumerate() {
                                     {
-                                        let structural_error = column_has_structural_error(analysis);
                                         let label = column_type_label(analysis);
                                         let is_diagnostic_target = diagnostic_target.read().as_ref()
                                             == Some(&DiagnosticTarget::Column(column_index));
-                                        let diagnostic_class = if structural_error || !analysis.problems.is_empty() {
+                                        let diagnostic_class = if column_problem_severity(analysis) == Some(ProblemSeverity::Error) {
                                             if is_diagnostic_target { "type-error type-selected" } else { "type-error" }
-                                        } else if analysis.has_mixed_warning {
+                                        } else if column_problem_severity(analysis) == Some(ProblemSeverity::Warning)
+                                            || analysis.has_mixed_warning
+                                        {
                                             if is_diagnostic_target { "type-warning type-selected" } else { "type-warning" }
                                         } else if is_diagnostic_target {
                                             "type-selected"
@@ -3423,6 +3517,7 @@ fn render_csv_document(
                                 th { class: "focus-side-spacer", "" }
                             }
                         }
+                        }
                     }
                     tbody {
                         if top_spacer_height > 0.0 {
@@ -3462,7 +3557,7 @@ fn render_csv_document(
                                             row_index: source_row_index,
                                             column_index,
                                         };
-                                        let problem_reasons = analyses
+                                        let cell_problem = analyses
                                             .as_deref()
                                             .and_then(|columns| columns.get(column_index))
                                             .and_then(|analysis| {
@@ -3470,11 +3565,21 @@ fn render_csv_document(
                                                     .problems
                                                     .iter()
                                                     .find(|problem| problem.row_index == source_row_index)
-                                                    .map(|problem| cell_problem_reasons(&problem.kinds, analysis))
+                                                    .map(|problem| (analysis, problem))
+                                            });
+                                        let problem_reasons = cell_problem
+                                            .map(|(analysis, problem)| {
+                                                cell_problem_reasons(
+                                                    &problem.kinds,
+                                                    analysis,
+                                                    problem.detail.as_ref(),
+                                                )
                                             })
                                             .unwrap_or_default();
-                                        let has_problem = !problem_reasons.is_empty();
+                                        let problem_severity = cell_problem
+                                            .and_then(|(_, problem)| problem.severity());
                                         let is_selected = selected_cell.read().as_ref() == Some(&location);
+                                        let is_multiline = is_multiline_cell(value);
                                         let editing_value = if read_only {
                                             None
                                         } else {
@@ -3498,12 +3603,11 @@ fn render_csv_document(
                                             focused_index,
                                             column_index,
                                         );
-                                        let cell_state_class = match (has_problem, is_selected) {
-                                            (true, true) => "cell-error cell-selected",
-                                            (true, false) => "cell-error",
-                                            (false, true) => "cell-selected",
-                                            (false, false) => "",
-                                        };
+                                        let cell_state_class = cell_state_class(
+                                            problem_severity,
+                                            is_multiline,
+                                            is_selected,
+                                        );
                                         let class = with_column_focus_class(
                                             cell_state_class,
                                             column_index,
@@ -3518,7 +3622,11 @@ fn render_csv_document(
                                         let json_keyboard_path = location.path.clone();
                                         let draft_value = value.clone();
                                         let promotion_context = preview_edit_context.clone();
-                                        let cell_title = cell_problem_tooltip(value, &problem_reasons);
+                                        let cell_title = cell_tooltip(
+                                            value,
+                                            &problem_reasons,
+                                            is_multiline,
+                                        );
                                         let (json_highlight_id, json_input_id) = json_editor_ids(
                                             &path,
                                             source_row_index,
@@ -4026,6 +4134,7 @@ fn change_delimiter(
                 let bytes = document.to_bytes();
                 CsvDocument::from_bytes(path, &bytes, Some(delimiter.byte()))
                     .map(|reparsed| {
+                        *header_rows = effective_header_rows(&reparsed.records, *header_rows);
                         *document = reparsed;
                         (*header_rows, stats_for_document(document, *header_rows))
                     })
@@ -4914,6 +5023,31 @@ fn localized_delimiter_label(delimiter: CsvDelimiter) -> &'static str {
     })
 }
 
+fn should_render_type_row(table_kind: TableKind) -> bool {
+    table_kind == TableKind::Standard
+}
+
+fn is_multiline_cell(value: &str) -> bool {
+    value.contains(['\r', '\n'])
+}
+
+fn cell_state_class(
+    severity: Option<ProblemSeverity>,
+    is_multiline: bool,
+    is_selected: bool,
+) -> &'static str {
+    match (severity, is_multiline, is_selected) {
+        (Some(ProblemSeverity::Error), _, true) => "cell-error cell-selected",
+        (Some(ProblemSeverity::Error), _, false) => "cell-error",
+        (Some(ProblemSeverity::Warning), _, true) => "cell-warning cell-selected",
+        (Some(ProblemSeverity::Warning), _, false) => "cell-warning",
+        (None, true, true) => "cell-multiline cell-selected",
+        (None, true, false) => "cell-multiline",
+        (None, false, true) => "cell-selected",
+        (None, false, false) => "",
+    }
+}
+
 fn resized_dimension(start_width: usize, delta: f64, minimum: usize, maximum: usize) -> usize {
     let delta = if delta.is_finite() { delta } else { 0.0 };
     (start_width as f64 + delta)
@@ -5633,10 +5767,7 @@ fn attempt_save_tab(
             notice.set(Some(tr(Text::AnalysisRunningSave).to_owned()));
             return false;
         };
-        analyses
-            .iter()
-            .map(|analysis| analysis.problems.len())
-            .sum::<usize>()
+        cell_error_count(&analyses)
     };
     if text_parse_issue.is_some() || problem_count > 0 {
         let description = match text_parse_issue.as_ref() {
@@ -6085,20 +6216,38 @@ fn file_name(path: &std::path::Path) -> String {
         .to_owned()
 }
 
-const CELL_PROBLEM_KINDS: [CellProblemKind; 5] = [
+const CELL_PROBLEM_KINDS: [CellProblemKind; 7] = [
+    CellProblemKind::InvalidTypeDeclaration,
+    CellProblemKind::DuplicateKey,
+    CellProblemKind::DeclaredTypeMismatch,
     CellProblemKind::StructuralMismatch,
-    CellProblemKind::RealLineBreak,
     CellProblemKind::DangerousInvisibleCharacter,
     CellProblemKind::UnescapedQuote,
     CellProblemKind::InvalidBackslashEscape,
 ];
 
-fn cell_problem_reason(kind: CellProblemKind, analysis: &ColumnAnalysis) -> String {
+fn cell_problem_reason(
+    kind: CellProblemKind,
+    analysis: &ColumnAnalysis,
+    detail: Option<&CellProblemDetail>,
+) -> String {
     match kind {
+        CellProblemKind::InvalidTypeDeclaration => {
+            tr(Text::ProblemInvalidTypeDeclaration).to_owned()
+        }
+        CellProblemKind::DuplicateKey => tr(Text::ProblemDuplicateKey).to_owned(),
+        CellProblemKind::DeclaredTypeMismatch => match detail {
+            Some(CellProblemDetail::DeclaredTypeMismatch { expected, path }) => {
+                l10n(Message::DeclaredTypeMismatch { expected, path })
+            }
+            None => l10n(Message::DeclaredTypeMismatch {
+                expected: "?",
+                path: "$",
+            }),
+        },
         CellProblemKind::StructuralMismatch => {
             l10n(Message::StructuralMismatch(&analysis.type_expression))
         }
-        CellProblemKind::RealLineBreak => tr(Text::ProblemRealLineBreak).to_owned(),
         CellProblemKind::DangerousInvisibleCharacter => {
             tr(Text::ProblemDangerousInvisibleCharacter).to_owned()
         }
@@ -6109,27 +6258,35 @@ fn cell_problem_reason(kind: CellProblemKind, analysis: &ColumnAnalysis) -> Stri
     }
 }
 
-fn cell_problem_reasons(kinds: &[CellProblemKind], analysis: &ColumnAnalysis) -> Vec<String> {
+fn cell_problem_reasons(
+    kinds: &[CellProblemKind],
+    analysis: &ColumnAnalysis,
+    detail: Option<&CellProblemDetail>,
+) -> Vec<String> {
     kinds
         .iter()
-        .map(|kind| cell_problem_reason(*kind, analysis))
+        .map(|kind| cell_problem_reason(*kind, analysis, detail))
         .collect()
 }
 
-fn cell_problem_tooltip(value: &str, reasons: &[String]) -> String {
-    if reasons.is_empty() {
+fn cell_tooltip(value: &str, reasons: &[String], is_multiline: bool) -> String {
+    if reasons.is_empty() && !is_multiline {
         return value.to_owned();
     }
-    let reasons = reasons
-        .iter()
-        .map(|reason| format!("- {reason}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "{}:\n{reasons}\n\n{}:\n{value}",
-        tr(Text::ProblemReasons),
-        tr(Text::CellValue),
-    )
+    let mut sections = Vec::new();
+    if is_multiline {
+        sections.push(tr(Text::MultilineText).to_owned());
+    }
+    if !reasons.is_empty() {
+        let reasons = reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("{}:\n{reasons}", tr(Text::ProblemReasons)));
+    }
+    sections.push(format!("{}:\n{value}", tr(Text::CellValue)));
+    sections.join("\n\n")
 }
 
 fn column_problem_summary(analysis: &ColumnAnalysis) -> String {
@@ -6141,11 +6298,30 @@ fn column_problem_summary(analysis: &ColumnAnalysis) -> String {
                 .iter()
                 .filter(|problem| problem.kinds.contains(kind))
                 .count();
-            (count > 0).then(|| format!("- {} ({count})", cell_problem_reason(*kind, analysis)))
+            (count > 0)
+                .then(|| format!("- {} ({count})", cell_problem_reason(*kind, analysis, None)))
         })
         .collect::<Vec<_>>()
         .join("\n");
     format!("{}:\n{lines}", tr(Text::ProblemReasons))
+}
+
+fn column_problem_severity(analysis: &ColumnAnalysis) -> Option<ProblemSeverity> {
+    if analysis
+        .problems
+        .iter()
+        .any(|problem| problem.severity() == Some(ProblemSeverity::Error))
+    {
+        Some(ProblemSeverity::Error)
+    } else if analysis
+        .problems
+        .iter()
+        .any(|problem| problem.severity() == Some(ProblemSeverity::Warning))
+    {
+        Some(ProblemSeverity::Warning)
+    } else {
+        None
+    }
 }
 
 fn column_has_structural_error(analysis: &ColumnAnalysis) -> bool {
@@ -6175,6 +6351,23 @@ fn column_type_tooltip(analysis: &ColumnAnalysis) -> String {
         sections.push(tr(Text::MixedTypeReason).to_owned());
     }
     sections.join("\n\n")
+}
+
+fn cell_problem_counts(analyses: &[ColumnAnalysis]) -> (usize, usize) {
+    analyses
+        .iter()
+        .flat_map(|analysis| &analysis.problems)
+        .fold((0, 0), |(errors, warnings), problem| {
+            match problem.severity() {
+                Some(ProblemSeverity::Error) => (errors + 1, warnings),
+                Some(ProblemSeverity::Warning) => (errors, warnings + 1),
+                None => (errors, warnings),
+            }
+        })
+}
+
+fn cell_error_count(analyses: &[ColumnAnalysis]) -> usize {
+    cell_problem_counts(analyses).0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6222,19 +6415,23 @@ fn document_status(
                 .and_then(|state| state.ready_columns(document.analysis_version(), header_rows))
         })
         .flatten();
-    let (red_cells, yellow_columns) = analyses
+    let (red_cells, yellow_cells, yellow_columns) = analyses
         .as_deref()
         .map(|columns| {
+            let (red_cells, yellow_cells) = cell_problem_counts(columns);
             (
-                columns.iter().map(|analysis| analysis.problems.len()).sum(),
+                red_cells,
+                yellow_cells,
                 columns
                     .iter()
                     .filter(|analysis| analysis.has_mixed_warning)
                     .count(),
             )
         })
-        .map_or((None, None), |(red, yellow)| (Some(red), Some(yellow)));
-    let diagnostic = analyses.as_deref().and_then(|columns| {
+        .map_or((None, None, None), |(red, yellow_cells, yellow_columns)| {
+            (Some(red), Some(yellow_cells), Some(yellow_columns))
+        });
+    let selected_problem = analyses.as_deref().and_then(|columns| {
         let location = selected_cell.filter(|location| {
             location.path == document.path && location.row_index >= header_rows
         })?;
@@ -6243,10 +6440,14 @@ fn document_status(
             .problems
             .iter()
             .find(|problem| problem.row_index == location.row_index)?;
-        let reasons = cell_problem_reasons(&problem.kinds, analysis);
+        Some((analysis, problem))
+    });
+    let diagnostic = selected_problem.and_then(|(analysis, problem)| {
+        let reasons = cell_problem_reasons(&problem.kinds, analysis, problem.detail.as_ref());
         (!reasons.is_empty())
             .then(|| format!("{}: {}", tr(Text::ProblemReasons), reasons.join(" · ")))
     });
+    let diagnostic_severity = selected_problem.and_then(|(_, problem)| problem.severity());
 
     DocumentStatus {
         file_name: file_name(&document.path),
@@ -6254,7 +6455,9 @@ fn document_status(
         encoding: document.encoding.label(),
         position,
         diagnostic,
+        diagnostic_severity,
         red_cells,
+        yellow_cells,
         yellow_columns,
         parse_errors: text_parse_issue.map(|issue| issue.count),
         analysis_loading: table_view && document.records.len() >= header_rows && analyses.is_none(),
@@ -6483,8 +6686,20 @@ mod tests {
 
     #[test]
     fn remounted_virtual_table_restores_its_saved_scroll_position() {
+        let source = include_str!("main.rs");
         assert!(RESTORE_TABLE_SCROLL_JS.contains("table.dataset.scrollTop"));
-        assert!(RESTORE_TABLE_SCROLL_JS.contains("table.scrollTop = desiredScrollTop"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("desiredScrollTop < 0"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("Math.min(desiredScrollTop, maximumScrollTop)"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("scheduleTableScrollRestore"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("expectedPath"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("expectedScrollTop"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("synchronizeClamped"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("scheduledScrollTop"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("restoredScrollTop"));
+        assert!(source.contains("mutation.attributeName === \"data-path\""));
+        assert!(!source.contains("mutation.attributeName === \"data-scroll-top\""));
+        assert!(source.contains("attributeFilter: [\"class\", \"data-path\"]"));
+        assert!(source.contains("key: \"{table_key}\""));
     }
 
     #[test]
@@ -6545,6 +6760,12 @@ mod tests {
         assert!(APP_CSS.contains(".field-header th.focus-column"));
         assert!(APP_CSS.contains(".type-row th.focus-column"));
         assert!(APP_CSS.contains(".focus-mode-status"));
+    }
+
+    #[test]
+    fn misc_tables_hide_only_the_inferred_type_row() {
+        assert!(!should_render_type_row(TableKind::Misc));
+        assert!(should_render_type_row(TableKind::Standard));
     }
 
     #[test]
@@ -6771,8 +6992,10 @@ mod tests {
             Some(l10n(Message::TablePosition { row: 2, column: 2 }).as_str())
         );
         assert_eq!(status.red_cells, Some(0));
+        assert_eq!(status.yellow_cells, Some(0));
         assert_eq!(status.yellow_columns, Some(1));
         assert_eq!(status.diagnostic, None);
+        assert_eq!(status.diagnostic_severity, None);
         assert!(!status.analysis_loading);
     }
 
@@ -6791,9 +7014,9 @@ mod tests {
             .iter()
             .find(|problem| problem.row_index == 2)
             .unwrap();
-        let reasons = cell_problem_reasons(&problem.kinds, analysis);
-        let all_reasons = cell_problem_reasons(&CELL_PROBLEM_KINDS, analysis);
-        let tooltip = cell_problem_tooltip("broken", &reasons);
+        let reasons = cell_problem_reasons(&problem.kinds, analysis, problem.detail.as_ref());
+        let all_reasons = cell_problem_reasons(&CELL_PROBLEM_KINDS, analysis, None);
+        let tooltip = cell_tooltip("broken", &reasons, false);
         let summary = column_problem_summary(analysis);
         let type_tooltip = column_type_tooltip(analysis);
         assert_eq!(column_type_label(analysis), "{id:number}*");
@@ -6819,7 +7042,7 @@ mod tests {
         );
 
         assert_eq!(reasons.len(), 1);
-        assert_eq!(all_reasons.len(), 5);
+        assert_eq!(all_reasons.len(), CELL_PROBLEM_KINDS.len());
         assert!(all_reasons.iter().all(|reason| !reason.is_empty()));
         assert!(tooltip.contains(tr(Text::ProblemReasons)));
         assert!(tooltip.contains("broken"));
@@ -6832,7 +7055,191 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.contains("{id:number}"))
         );
-        assert_eq!(cell_problem_tooltip("plain", &[]), "plain");
+        assert_eq!(status.diagnostic_severity, Some(ProblemSeverity::Error));
+        assert_eq!(status.red_cells, Some(1));
+        assert_eq!(status.yellow_cells, Some(0));
+        assert_eq!(cell_tooltip("plain", &[], false), "plain");
+    }
+
+    #[test]
+    fn multiline_cells_use_an_informational_style_without_masking_errors() {
+        assert!(is_multiline_cell("first\nsecond"));
+        assert!(is_multiline_cell("first\rsecond"));
+        assert!(is_multiline_cell("first\r\nsecond"));
+        assert!(!is_multiline_cell(r"first\nsecond"));
+
+        assert_eq!(cell_state_class(None, true, false), "cell-multiline");
+        assert_eq!(
+            cell_state_class(None, true, true),
+            "cell-multiline cell-selected"
+        );
+        assert_eq!(
+            cell_state_class(Some(ProblemSeverity::Warning), true, false),
+            "cell-warning"
+        );
+        assert_eq!(
+            cell_state_class(Some(ProblemSeverity::Warning), true, true),
+            "cell-warning cell-selected"
+        );
+        assert_eq!(
+            cell_state_class(Some(ProblemSeverity::Error), true, false),
+            "cell-error"
+        );
+        assert_eq!(
+            cell_state_class(Some(ProblemSeverity::Error), true, true),
+            "cell-error cell-selected"
+        );
+
+        let tooltip = cell_tooltip("first\nsecond", &[], true);
+        assert!(tooltip.contains(tr(Text::MultilineText)));
+        assert!(tooltip.contains("first\nsecond"));
+    }
+
+    #[test]
+    fn multiline_cells_do_not_feed_error_counts_or_navigation() {
+        let document = CsvDocument::from_bytes(
+            Path::new("multiline.csv"),
+            b"id,note\n1,\"first\nsecond\"\n2,first\\nsecond\n",
+            Some(b','),
+        )
+        .unwrap();
+        let columns = analyze_table(document.records.as_ref(), 1);
+        let state = TableAnalysisState::Ready {
+            document_version: document.analysis_version(),
+            header_rows: 1,
+            columns: Arc::new(columns.clone()),
+        };
+
+        assert_eq!(cell_problem_counts(&columns), (0, 0));
+        assert!(diagnostic_targets(&columns).is_empty());
+        let status = document_status(
+            &document,
+            &document.raw_text,
+            DocumentView::Table,
+            None,
+            1,
+            None,
+            None,
+            Some(&state),
+        );
+        assert_eq!(status.red_cells, Some(0));
+        assert_eq!(status.yellow_cells, Some(0));
+        assert_eq!(status.diagnostic, None);
+    }
+
+    #[test]
+    fn character_warnings_are_yellow_navigable_and_do_not_require_save_confirmation() {
+        let document = CsvDocument::from_bytes(
+            Path::new("warnings.csv"),
+            b"id,note\n1,bad\"quote\\q\n",
+            Some(b','),
+        )
+        .unwrap();
+        let columns = Arc::new(analyze_table(document.records.as_ref(), 1));
+        let targets = diagnostic_targets(&columns);
+        let state = TableAnalysisState::Ready {
+            document_version: document.analysis_version(),
+            header_rows: 1,
+            columns: columns.clone(),
+        };
+        let selected = CellLocation {
+            path: document.path.clone(),
+            row_index: 1,
+            column_index: 1,
+        };
+        let status = document_status(
+            &document,
+            &document.raw_text,
+            DocumentView::Table,
+            None,
+            1,
+            Some(&selected),
+            None,
+            Some(&state),
+        );
+
+        assert_eq!(cell_problem_counts(&columns), (0, 1));
+        assert_eq!(cell_error_count(&columns), 0);
+        assert_eq!(
+            column_problem_severity(&columns[1]),
+            Some(ProblemSeverity::Warning)
+        );
+        assert_eq!(
+            targets,
+            vec![DiagnosticTarget::Cell(GridPosition {
+                row_index: 1,
+                column_index: 1,
+            })]
+        );
+        assert_eq!(status.red_cells, Some(0));
+        assert_eq!(status.yellow_cells, Some(1));
+        assert_eq!(status.yellow_columns, Some(0));
+        assert_eq!(status.diagnostic_severity, Some(ProblemSeverity::Warning));
+        assert!(
+            status
+                .diagnostic
+                .is_some_and(|reason| reason.contains(tr(Text::ProblemUnescapedQuote))
+                    && reason.contains(tr(Text::ProblemInvalidBackslashEscape)))
+        );
+    }
+
+    #[test]
+    fn misc_diagnostics_feed_navigation_status_and_red_cell_counts() {
+        let document = CsvDocument::from_bytes(
+            Path::new("misc.csv"),
+            b"type,key,value,note\nvalueType,key,value,anything\nnumber,SAME,1,n\nstring,SAME,2,n\nnumber,BAD,nope,n\n",
+            Some(b','),
+        )
+        .unwrap();
+        let columns = Arc::new(analyze_table(document.records.as_ref(), 2));
+        let targets = diagnostic_targets(&columns);
+        assert_eq!(
+            targets,
+            vec![
+                DiagnosticTarget::Cell(GridPosition {
+                    row_index: 2,
+                    column_index: 1,
+                }),
+                DiagnosticTarget::Cell(GridPosition {
+                    row_index: 3,
+                    column_index: 1,
+                }),
+                DiagnosticTarget::Cell(GridPosition {
+                    row_index: 4,
+                    column_index: 2,
+                }),
+            ]
+        );
+        let state = TableAnalysisState::Ready {
+            document_version: document.analysis_version(),
+            header_rows: 2,
+            columns,
+        };
+        let selected = CellLocation {
+            path: document.path.clone(),
+            row_index: 4,
+            column_index: 2,
+        };
+
+        let status = document_status(
+            &document,
+            &document.raw_text,
+            DocumentView::Table,
+            None,
+            2,
+            Some(&selected),
+            None,
+            Some(&state),
+        );
+
+        assert_eq!(status.red_cells, Some(3));
+        assert_eq!(status.yellow_cells, Some(0));
+        assert_eq!(status.yellow_columns, Some(0));
+        assert!(
+            status
+                .diagnostic
+                .is_some_and(|reason| reason.contains("number") && reason.contains('$'))
+        );
     }
 
     #[test]
@@ -6862,6 +7269,7 @@ mod tests {
             Some(l10n(Message::TextPosition { line: 2, column: 4 }).as_str())
         );
         assert_eq!(status.red_cells, None);
+        assert_eq!(status.yellow_cells, None);
         assert!(!status.analysis_loading);
     }
 

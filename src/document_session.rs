@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::csv_document::{CsvDocument, CsvDocumentError, CsvEncoding, DelimiterSource};
+use crate::diagnostics::effective_header_rows;
 use crate::settings::{DEFAULT_HEADER_ROWS, MAX_HEADER_ROWS, MIN_HEADER_ROWS};
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -114,6 +115,7 @@ impl DocumentSession {
         let current_hash = blake3::hash(&document.to_bytes());
         let delimiter_override =
             (document.delimiter_source == DelimiterSource::Manual).then_some(document.delimiter);
+        let header_rows = effective_header_rows(&document.records, header_rows);
         Ok(Self {
             document,
             header_rows,
@@ -181,6 +183,7 @@ impl DocumentSession {
         } else {
             blake3::hash(&document.to_bytes())
         };
+        let header_rows = effective_header_rows(&document.records, header_rows);
         Ok(Self {
             document,
             header_rows,
@@ -245,6 +248,7 @@ impl DocumentSession {
             self.undo_stack.clear();
             self.redo_stack.clear();
         }
+        self.header_rows = effective_header_rows(&parsed.records, self.header_rows);
         self.document = parsed;
         self.text_override = None;
         self.text_parse_issue = None;
@@ -295,13 +299,14 @@ impl DocumentSession {
 
     pub fn set_header_rows(&mut self, header_rows: usize) -> Result<(), DocumentSessionError> {
         validate_header_rows(header_rows)?;
-        self.header_rows = header_rows;
+        self.header_rows = effective_header_rows(&self.document.records, header_rows);
         Ok(())
     }
 
     pub fn set_delimiter(&mut self, delimiter: u8) -> Result<(), DocumentSessionError> {
         let bytes = self.text_bytes();
         let reparsed = CsvDocument::from_bytes(&self.document.path, &bytes, Some(delimiter))?;
+        self.header_rows = effective_header_rows(&reparsed.records, self.header_rows);
         self.document = reparsed;
         self.text_override = None;
         self.current_hash = hash_text(self.document.has_bom, &self.document.raw_text);
@@ -678,6 +683,23 @@ mod tests {
             session.set_header_rows(0),
             Err(DocumentSessionError::InvalidHeaderRows(0))
         ));
+    }
+
+    #[test]
+    fn misc_tables_force_two_header_rows_without_changing_dirty_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("misc.csv");
+        fs::write(
+            &path,
+            "类型,键,值,说明\nvalueType,key,value,beizhu\nnumber,COUNT,1,数量\n",
+        )
+        .unwrap();
+        let mut session = DocumentSession::open_with_options(&path, Some(b','), 4).unwrap();
+
+        assert_eq!(session.header_rows, 2);
+        session.set_header_rows(4).unwrap();
+        assert_eq!(session.header_rows, 2);
+        assert!(!session.is_dirty());
     }
 
     #[test]

@@ -2,6 +2,32 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+pub const MISC_HEADER_ROWS: usize = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableKind {
+    Standard,
+    Misc,
+}
+
+pub fn table_kind(records: &[Vec<String>]) -> TableKind {
+    let has_misc_header = records.get(1).is_some_and(|header| {
+        header.len() == 4 && header[0] == "valueType" && header[1] == "key" && header[2] == "value"
+    });
+    if has_misc_header && records.iter().all(|record| record.len() == 4) {
+        TableKind::Misc
+    } else {
+        TableKind::Standard
+    }
+}
+
+pub fn effective_header_rows(records: &[Vec<String>], configured: usize) -> usize {
+    match table_kind(records) {
+        TableKind::Standard => configured,
+        TableKind::Misc => MISC_HEADER_ROWS,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColumnType {
     String,
@@ -29,17 +55,64 @@ impl ColumnType {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CellProblemKind {
+    InvalidTypeDeclaration,
+    DuplicateKey,
+    DeclaredTypeMismatch,
     StructuralMismatch,
-    RealLineBreak,
     DangerousInvisibleCharacter,
     UnescapedQuote,
     InvalidBackslashEscape,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProblemSeverity {
+    Warning,
+    Error,
+}
+
+impl CellProblemKind {
+    pub const fn severity(self) -> ProblemSeverity {
+        match self {
+            Self::UnescapedQuote | Self::InvalidBackslashEscape => ProblemSeverity::Warning,
+            Self::InvalidTypeDeclaration
+            | Self::DuplicateKey
+            | Self::DeclaredTypeMismatch
+            | Self::StructuralMismatch
+            | Self::DangerousInvisibleCharacter => ProblemSeverity::Error,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CellProblemDetail {
+    DeclaredTypeMismatch { expected: String, path: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CellProblem {
     pub row_index: usize,
     pub kinds: Vec<CellProblemKind>,
+    pub detail: Option<CellProblemDetail>,
+}
+
+impl CellProblem {
+    pub fn severity(&self) -> Option<ProblemSeverity> {
+        if self
+            .kinds
+            .iter()
+            .any(|kind| kind.severity() == ProblemSeverity::Error)
+        {
+            Some(ProblemSeverity::Error)
+        } else if self
+            .kinds
+            .iter()
+            .any(|kind| kind.severity() == ProblemSeverity::Warning)
+        {
+            Some(ProblemSeverity::Warning)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +125,13 @@ pub struct ColumnAnalysis {
 }
 
 pub fn analyze_table(records: &[Vec<String>], header_rows: usize) -> Vec<ColumnAnalysis> {
+    if table_kind(records) == TableKind::Misc {
+        return analyze_misc_table(records);
+    }
+    analyze_standard_table(records, header_rows)
+}
+
+fn analyze_standard_table(records: &[Vec<String>], header_rows: usize) -> Vec<ColumnAnalysis> {
     let column_count = records.first().map_or(0, Vec::len);
     (0..column_count)
         .map(|column_index| {
@@ -94,7 +174,11 @@ pub fn analyze_column(values: &[(usize, &str)]) -> ColumnAnalysis {
         kinds.sort_unstable_by_key(|kind| *kind as u8);
         kinds.dedup();
         if !kinds.is_empty() {
-            problems.push(CellProblem { row_index, kinds });
+            problems.push(CellProblem {
+                row_index,
+                kinds,
+                detail: None,
+            });
         }
     }
 
@@ -104,6 +188,386 @@ pub fn analyze_column(values: &[(usize, &str)]) -> ColumnAnalysis {
         has_mixed_warning,
         problems,
         max_content_chars,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeclaredType {
+    String,
+    Number,
+    Bool,
+    Null,
+    Array(Box<DeclaredType>),
+    Object(BTreeMap<String, DeclaredType>),
+}
+
+impl DeclaredType {
+    fn render(&self) -> String {
+        match self {
+            Self::String => "string".to_owned(),
+            Self::Number => "number".to_owned(),
+            Self::Bool => "bool".to_owned(),
+            Self::Null => "null".to_owned(),
+            Self::Array(element) => format!("{}[]", element.render()),
+            Self::Object(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|(name, field_type)| {
+                        format!("{}:{}", render_field_name(name), field_type.render())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{{fields}}}")
+            }
+        }
+    }
+
+    fn is_primitive(&self) -> bool {
+        matches!(self, Self::String | Self::Number | Self::Bool | Self::Null)
+    }
+
+    fn validate_cell(&self, value: &str) -> Result<(), String> {
+        if let Self::Array(element) = self
+            && element.is_primitive()
+        {
+            if let Ok(json @ Value::Array(_)) = serde_json::from_str::<Value>(value) {
+                return self.validate_json(&json, "$".to_owned());
+            }
+            for (index, item) in value.split(',').enumerate() {
+                element
+                    .validate_cell(item.trim())
+                    .map_err(|_| format!("$[{index}]"))?;
+            }
+            return Ok(());
+        }
+
+        match self {
+            Self::String => Ok(()),
+            Self::Number => match serde_json::from_str::<Value>(value.trim()) {
+                Ok(Value::Number(_)) => Ok(()),
+                _ => Err("$".to_owned()),
+            },
+            Self::Bool if matches!(value.trim(), "true" | "false" | "0" | "1") => Ok(()),
+            Self::Bool => Err("$".to_owned()),
+            Self::Null if value.trim() == "null" => Ok(()),
+            Self::Null => Err("$".to_owned()),
+            Self::Array(_) | Self::Object(_) => serde_json::from_str::<Value>(value.trim())
+                .map_err(|_| "$".to_owned())
+                .and_then(|json| self.validate_json(&json, "$".to_owned())),
+        }
+    }
+
+    fn validate_json(&self, value: &Value, path: String) -> Result<(), String> {
+        match (self, value) {
+            (Self::String, Value::String(_))
+            | (Self::Number, Value::Number(_))
+            | (Self::Null, Value::Null) => Ok(()),
+            (Self::Bool, Value::Bool(_)) => Ok(()),
+            (Self::Bool, Value::Number(number))
+                if number.as_i64().is_some_and(|value| matches!(value, 0 | 1)) =>
+            {
+                Ok(())
+            }
+            (Self::Array(element), Value::Array(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    element.validate_json(item, format!("{path}[{index}]"))?;
+                }
+                Ok(())
+            }
+            (Self::Object(expected), Value::Object(actual)) => {
+                for name in expected.keys() {
+                    if !actual.contains_key(name) {
+                        return Err(object_path(&path, name));
+                    }
+                }
+                for name in actual.keys() {
+                    if !expected.contains_key(name) {
+                        return Err(object_path(&path, name));
+                    }
+                }
+                for (name, field_type) in expected {
+                    field_type.validate_json(
+                        actual.get(name).expect("object keys were checked above"),
+                        object_path(&path, name),
+                    )?;
+                }
+                Ok(())
+            }
+            _ => Err(path),
+        }
+    }
+}
+
+fn object_path(parent: &str, name: &str) -> String {
+    let mut characters = name.chars();
+    let identifier = characters
+        .next()
+        .is_some_and(|character| character == '_' || character == '$' || character.is_alphabetic())
+        && characters
+            .all(|character| character == '_' || character == '$' || character.is_alphanumeric());
+    if identifier {
+        format!("{parent}.{name}")
+    } else {
+        format!(
+            "{parent}[{}]",
+            serde_json::to_string(name).expect("serializing a JSON object key cannot fail")
+        )
+    }
+}
+
+struct DeclaredTypeParser<'a> {
+    source: &'a str,
+    offset: usize,
+}
+
+impl<'a> DeclaredTypeParser<'a> {
+    fn parse(source: &'a str) -> Result<DeclaredType, ()> {
+        let mut parser = Self { source, offset: 0 };
+        let declared = parser.parse_type()?;
+        parser.skip_whitespace();
+        if parser.offset == source.len() {
+            Ok(declared)
+        } else {
+            Err(())
+        }
+    }
+
+    fn parse_type(&mut self) -> Result<DeclaredType, ()> {
+        self.skip_whitespace();
+        let mut declared = if self.peek() == Some('{') {
+            self.parse_object()?
+        } else {
+            match self.parse_identifier()?.as_str() {
+                "string" => DeclaredType::String,
+                "number" => DeclaredType::Number,
+                "bool" => DeclaredType::Bool,
+                "null" => DeclaredType::Null,
+                _ => return Err(()),
+            }
+        };
+        loop {
+            self.skip_whitespace();
+            if !self.consume('[') {
+                break;
+            }
+            self.skip_whitespace();
+            if !self.consume(']') {
+                return Err(());
+            }
+            declared = DeclaredType::Array(Box::new(declared));
+        }
+        Ok(declared)
+    }
+
+    fn parse_object(&mut self) -> Result<DeclaredType, ()> {
+        if !self.consume('{') {
+            return Err(());
+        }
+        let mut fields = BTreeMap::new();
+        self.skip_whitespace();
+        if self.consume('}') {
+            return Ok(DeclaredType::Object(fields));
+        }
+        loop {
+            self.skip_whitespace();
+            let name = if self.peek() == Some('"') {
+                self.parse_quoted_name()?
+            } else {
+                self.parse_identifier()?
+            };
+            self.skip_whitespace();
+            if !self.consume(':') {
+                return Err(());
+            }
+            let field_type = self.parse_type()?;
+            if fields.insert(name, field_type).is_some() {
+                return Err(());
+            }
+            self.skip_whitespace();
+            if self.consume('}') {
+                break;
+            }
+            if !self.consume(',') {
+                return Err(());
+            }
+        }
+        Ok(DeclaredType::Object(fields))
+    }
+
+    fn parse_quoted_name(&mut self) -> Result<String, ()> {
+        let start = self.offset;
+        if !self.consume('"') {
+            return Err(());
+        }
+        let mut escaped = false;
+        while let Some(character) = self.peek() {
+            self.offset += character.len_utf8();
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                return serde_json::from_str(&self.source[start..self.offset]).map_err(|_| ());
+            }
+        }
+        Err(())
+    }
+
+    fn parse_identifier(&mut self) -> Result<String, ()> {
+        let start = self.offset;
+        let Some(first) = self.peek() else {
+            return Err(());
+        };
+        if first != '_' && first != '$' && !first.is_alphabetic() {
+            return Err(());
+        }
+        self.offset += first.len_utf8();
+        while let Some(character) = self.peek() {
+            if character != '_' && character != '$' && !character.is_alphanumeric() {
+                break;
+            }
+            self.offset += character.len_utf8();
+        }
+        Ok(self.source[start..self.offset].to_owned())
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(character) = self.peek() {
+            if !character.is_whitespace() {
+                break;
+            }
+            self.offset += character.len_utf8();
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.source[self.offset..].chars().next()
+    }
+
+    fn consume(&mut self, expected: char) -> bool {
+        if self.peek() != Some(expected) {
+            return false;
+        }
+        self.offset += expected.len_utf8();
+        true
+    }
+}
+
+fn analyze_misc_table(records: &[Vec<String>]) -> Vec<ColumnAnalysis> {
+    let mut columns = (0..4)
+        .map(|column_index| {
+            let values = records
+                .iter()
+                .enumerate()
+                .skip(MISC_HEADER_ROWS)
+                .map(|(row_index, row)| (row_index, row[column_index].as_str()))
+                .collect::<Vec<_>>();
+            analyze_misc_column(&values, column_index != 0)
+        })
+        .collect::<Vec<_>>();
+
+    let mut duplicate_rows = BTreeMap::<&str, Vec<usize>>::new();
+    for (row_index, row) in records.iter().enumerate().skip(MISC_HEADER_ROWS) {
+        if !row[1].is_empty() {
+            duplicate_rows.entry(&row[1]).or_default().push(row_index);
+        }
+        match DeclaredTypeParser::parse(&row[0]) {
+            Ok(declared) => {
+                if let Err(path) = declared.validate_cell(&row[2]) {
+                    add_problem(
+                        &mut columns[2],
+                        row_index,
+                        CellProblemKind::DeclaredTypeMismatch,
+                        Some(CellProblemDetail::DeclaredTypeMismatch {
+                            expected: declared.render(),
+                            path,
+                        }),
+                    );
+                }
+            }
+            Err(()) => add_problem(
+                &mut columns[0],
+                row_index,
+                CellProblemKind::InvalidTypeDeclaration,
+                None,
+            ),
+        }
+    }
+    for rows in duplicate_rows.values().filter(|rows| rows.len() > 1) {
+        for row_index in rows {
+            add_problem(
+                &mut columns[1],
+                *row_index,
+                CellProblemKind::DuplicateKey,
+                None,
+            );
+        }
+    }
+    for column in &mut columns {
+        column.problems.sort_by_key(|problem| problem.row_index);
+    }
+    columns
+}
+
+fn analyze_misc_column(values: &[(usize, &str)], check_string_escapes: bool) -> ColumnAnalysis {
+    let max_content_chars = values
+        .iter()
+        .flat_map(|(_, value)| value.lines())
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let problems = values
+        .iter()
+        .filter_map(|(row_index, value)| {
+            let mut kinds = dangerous_character_problems(value, classify_cell(value));
+            if !check_string_escapes {
+                kinds.retain(|kind| {
+                    !matches!(
+                        kind,
+                        CellProblemKind::UnescapedQuote | CellProblemKind::InvalidBackslashEscape
+                    )
+                });
+            }
+            (!kinds.is_empty()).then_some(CellProblem {
+                row_index: *row_index,
+                kinds,
+                detail: None,
+            })
+        })
+        .collect();
+    ColumnAnalysis {
+        column_type: ColumnType::String,
+        type_expression: "string".to_owned(),
+        has_mixed_warning: false,
+        problems,
+        max_content_chars,
+    }
+}
+
+fn add_problem(
+    analysis: &mut ColumnAnalysis,
+    row_index: usize,
+    kind: CellProblemKind,
+    detail: Option<CellProblemDetail>,
+) {
+    if let Some(problem) = analysis
+        .problems
+        .iter_mut()
+        .find(|problem| problem.row_index == row_index)
+    {
+        if !problem.kinds.contains(&kind) {
+            problem.kinds.push(kind);
+            problem.kinds.sort_unstable_by_key(|kind| *kind as u8);
+        }
+        if detail.is_some() {
+            problem.detail = detail;
+        }
+    } else {
+        analysis.problems.push(CellProblem {
+            row_index,
+            kinds: vec![kind],
+            detail,
+        });
     }
 }
 
@@ -468,9 +932,6 @@ fn classify_separator_array(value: &str) -> Option<CellType> {
 
 fn dangerous_character_problems(value: &str, cell_type: CellType) -> Vec<CellProblemKind> {
     let mut problems = Vec::new();
-    if value.contains(['\r', '\n']) {
-        problems.push(CellProblemKind::RealLineBreak);
-    }
     if value.chars().any(|character| {
         matches!(
             character,
@@ -693,13 +1154,21 @@ mod tests {
         assert!(
             analysis.problems[0]
                 .kinds
-                .contains(&CellProblemKind::RealLineBreak)
-        );
-        assert!(
-            analysis.problems[0]
-                .kinds
                 .contains(&CellProblemKind::DangerousInvisibleCharacter)
         );
+        assert_eq!(analysis.problems[0].kinds.len(), 1);
+    }
+
+    #[test]
+    fn real_line_breaks_are_not_diagnostic_problems() {
+        let analysis = analyze_column(&[
+            (2, "line\nbreak"),
+            (3, "line\rbreak"),
+            (4, "line\r\nbreak"),
+            (5, r"line\nbreak"),
+        ]);
+
+        assert!(analysis.problems.is_empty());
     }
 
     #[test]
@@ -719,6 +1188,37 @@ mod tests {
                 .kinds
                 .contains(&CellProblemKind::UnescapedQuote)
         );
+        assert_eq!(
+            invalid.problems[0].severity(),
+            Some(ProblemSeverity::Warning)
+        );
+    }
+
+    #[test]
+    fn character_warnings_do_not_include_curly_quotes_and_errors_take_precedence() {
+        let curly_quotes = analyze_column(&[(2, "中文“引号”")]);
+        let combined = analyze_column(&[(2, r#"{"id":1}"#), (3, r#"bad"quote\q"#)]);
+
+        assert!(curly_quotes.problems.is_empty());
+        assert_eq!(
+            combined.problems[0].severity(),
+            Some(ProblemSeverity::Error)
+        );
+        assert!(
+            combined.problems[0]
+                .kinds
+                .contains(&CellProblemKind::StructuralMismatch)
+        );
+        assert!(
+            combined.problems[0]
+                .kinds
+                .contains(&CellProblemKind::UnescapedQuote)
+        );
+        assert!(
+            combined.problems[0]
+                .kinds
+                .contains(&CellProblemKind::InvalidBackslashEscape)
+        );
     }
 
     #[test]
@@ -734,5 +1234,162 @@ mod tests {
 
         assert_eq!(analysis.len(), 1);
         assert_eq!(analysis[0].column_type, ColumnType::Bool);
+    }
+
+    #[test]
+    fn misc_tables_ignore_only_the_fourth_header_name() {
+        for fourth in ["fuzhu", "beizhu", "description"] {
+            let records = misc_records(&[["string", "A", "value", "note"]], fourth);
+            assert_eq!(table_kind(&records), TableKind::Misc);
+            assert_eq!(effective_header_rows(&records, 4), MISC_HEADER_ROWS);
+        }
+
+        let mut wrong_header = misc_records(&[["string", "A", "value", "note"]], "note");
+        wrong_header[1][1] = "name".to_owned();
+        assert_eq!(table_kind(&wrong_header), TableKind::Standard);
+
+        let mut five_columns = misc_records(&[["string", "A", "value", "note"]], "note");
+        for record in &mut five_columns {
+            record.push(String::new());
+        }
+        assert_eq!(table_kind(&five_columns), TableKind::Standard);
+        assert_eq!(effective_header_rows(&five_columns, 3), 3);
+    }
+
+    #[test]
+    fn declared_types_validate_current_scalar_array_and_object_forms() {
+        let records = misc_records(
+            &[
+                ["string", "EMPTY", "", "note"],
+                ["string", "NUMERIC_TEXT", "123", "note"],
+                ["number", "COUNT", "12.5", "note"],
+                ["bool", "ENABLED", "1", "note"],
+                ["null", "NONE", "null", "note"],
+                ["number[]", "RANGE", "1,2", "note"],
+                ["number[]", "ONE", "1", "note"],
+                ["number[]", "JSON_RANGE", "[1,2]", "note"],
+                ["string[]", "TOPIC", "one", "note"],
+                [
+                    r#"{"mid":number,"name":string}"#,
+                    "ITEM",
+                    r#"{"mid":1,"name":"ball"}"#,
+                    "note",
+                ],
+                [
+                    r#"{mid:number,tags:string[]}"#,
+                    "ITEMS",
+                    r#"{"mid":1,"tags":["a","b"]}"#,
+                    "note",
+                ],
+                [r#"{"1":number}"#, "NUMERIC_KEY", r#"{"1":55}"#, "note"],
+                ["string[][]", "GRID", r#"[["a"],["b"]]"#, "note"],
+            ],
+            "anything",
+        );
+
+        let analyses = analyze_table(&records, 5);
+
+        assert_eq!(analyses.len(), 4);
+        assert!(analyses.iter().all(|analysis| !analysis.has_mixed_warning));
+        assert!(analyses.iter().all(|analysis| analysis.problems.is_empty()));
+    }
+
+    #[test]
+    fn declared_type_parser_rejects_unions_optional_fields_and_trailing_input() {
+        for declaration in ["number|string", "{id?:number}", "number[] extra"] {
+            assert!(
+                DeclaredTypeParser::parse(declaration).is_err(),
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn misc_diagnostics_target_duplicate_declaration_and_value_cells() {
+        let records = misc_records(
+            &[
+                ["number", "SAME", "1", "note"],
+                ["string", "SAME", "numeric-looking", "note"],
+                ["not-a-type", "same", "value", "note"],
+                [
+                    r#"{"id":number}"#,
+                    "OBJECT",
+                    r#"{"id":1,"extra":2}"#,
+                    "note",
+                ],
+                ["number", "", "not-number", "note"],
+                ["number", "", "2", "note"],
+            ],
+            "note",
+        );
+
+        let analyses = analyze_table(&records, 2);
+
+        assert_eq!(
+            problem_rows(&analyses[1], CellProblemKind::DuplicateKey),
+            vec![2, 3]
+        );
+        assert_eq!(
+            problem_rows(&analyses[0], CellProblemKind::InvalidTypeDeclaration),
+            vec![4]
+        );
+        assert_eq!(
+            problem_rows(&analyses[2], CellProblemKind::DeclaredTypeMismatch),
+            vec![5, 6]
+        );
+        assert_eq!(
+            analyses[2].problems[0].detail,
+            Some(CellProblemDetail::DeclaredTypeMismatch {
+                expected: "{id:number}".to_owned(),
+                path: "$.extra".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn misc_type_declarations_do_not_trigger_quote_escape_warnings() {
+        let records = misc_records(
+            &[
+                [r#"{"mid":number}"#, "ITEM", r#"{"mid":1}"#, "line\nplain"],
+                ["string", "NOTE", "value", "line\n\u{200B}"],
+            ],
+            "note",
+        );
+
+        let analyses = analyze_table(&records, 2);
+
+        assert!(analyses[0].problems.is_empty());
+        assert!(analyses[2].problems.is_empty());
+        assert_eq!(analyses[3].problems[0].row_index, 3);
+        assert!(
+            analyses[3].problems[0]
+                .kinds
+                .contains(&CellProblemKind::DangerousInvisibleCharacter)
+        );
+        assert_eq!(analyses[3].problems[0].kinds.len(), 1);
+    }
+
+    fn misc_records(rows: &[[&str; 4]], fourth_header: &str) -> Vec<Vec<String>> {
+        let mut records = vec![
+            ["类型", "键", "值", "说明"].map(str::to_owned).to_vec(),
+            ["valueType", "key", "value", fourth_header]
+                .map(str::to_owned)
+                .to_vec(),
+        ];
+        records.extend(rows.iter().map(|row| {
+            row.iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        }));
+        records
+    }
+
+    fn problem_rows(analysis: &ColumnAnalysis, kind: CellProblemKind) -> Vec<usize> {
+        analysis
+            .problems
+            .iter()
+            .filter(|problem| problem.kinds.contains(&kind))
+            .map(|problem| problem.row_index)
+            .collect()
     }
 }

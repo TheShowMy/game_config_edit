@@ -26,6 +26,8 @@
   --error: #e06c75;
   --error-bg: rgb(224 108 117 / 10%);
   --error-solid-bg: #3d262b;
+  --multiline-bg: #183235;
+  --multiline-hover-bg: #1d3d40;
 
   --radius-sm: 4px;
   --radius-md: 6px;
@@ -890,6 +892,15 @@ input {
   color: var(--warn);
 }
 
+.csv-table .cell-multiline {
+  background: var(--multiline-bg);
+}
+
+.csv-table .cell-warning {
+  background: var(--warn-solid-bg);
+  color: var(--warn);
+}
+
 .csv-table thead .type-row .type-error,
 .csv-table .cell-error {
   background: var(--error-solid-bg);
@@ -918,6 +929,14 @@ input {
 
 .csv-table td:hover {
   background: var(--bg-hover);
+}
+
+.csv-table .cell-multiline:hover:not(.cell-selected) {
+  background: var(--multiline-hover-bg);
+}
+
+.csv-table .cell-warning:hover:not(.cell-selected) {
+  background: #453d29;
 }
 
 .csv-table .cell-selected {

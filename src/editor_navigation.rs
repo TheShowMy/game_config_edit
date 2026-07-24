@@ -125,7 +125,8 @@ mod tests {
                 .iter()
                 .map(|row_index| CellProblem {
                     row_index: *row_index,
-                    kinds: vec![CellProblemKind::RealLineBreak],
+                    kinds: vec![CellProblemKind::DangerousInvisibleCharacter],
+                    detail: None,
                 })
                 .collect(),
             has_mixed_warning,

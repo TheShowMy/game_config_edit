@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::csv_document::CsvDocument;
+use crate::diagnostics::effective_header_rows;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CsvFileEntry {
@@ -97,12 +98,17 @@ pub fn inspect_csv_file(
     delimiter_override: Option<u8>,
 ) -> CsvFileStats {
     match CsvDocument::open(path, delimiter_override) {
-        Ok(document) => match document.dimensions(header_rows) {
-            Some((data_rows, columns)) => CsvFileStats::Ready { data_rows, columns },
-            None => CsvFileStats::Error {
-                message: format!("file has fewer than the configured {header_rows} header records"),
-            },
-        },
+        Ok(document) => {
+            let header_rows = effective_header_rows(&document.records, header_rows);
+            match document.dimensions(header_rows) {
+                Some((data_rows, columns)) => CsvFileStats::Ready { data_rows, columns },
+                None => CsvFileStats::Error {
+                    message: format!(
+                        "file has fewer than the configured {header_rows} header records"
+                    ),
+                },
+            }
+        }
         Err(error) => CsvFileStats::Error {
             message: error.to_string(),
         },
@@ -270,6 +276,25 @@ mod tests {
             CsvFileStats::Ready {
                 data_rows: 2,
                 columns: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn misc_file_stats_force_two_header_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("misc.csv");
+        fs::write(
+            &path,
+            "类型,键,值,说明\nvalueType,key,value,anything\nnumber,COUNT,1,数量\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspect_csv_file(&path, 4, None),
+            CsvFileStats::Ready {
+                data_rows: 1,
+                columns: 4,
             }
         );
     }

@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "game-config-edit"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "clap",
@@ -1925,6 +1925,9 @@ dependencies = [
  "embed-resource",
  "encoding_rs",
  "notify",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rfd 0.15.4",
  "serde",
  "serde_json",

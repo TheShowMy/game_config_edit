@@ -81,6 +81,7 @@ pub enum Text {
     PreviewFailed,
     RevealInFileManager,
     HeaderRows,
+    MiscHeaderRowsFixed,
     EditorView,
     Delimiter,
     CsvDelimiter,
@@ -108,7 +109,9 @@ pub enum Text {
     JsonArray2d,
     ProblemReasons,
     CellValue,
-    ProblemRealLineBreak,
+    MultilineText,
+    ProblemInvalidTypeDeclaration,
+    ProblemDuplicateKey,
     ProblemDangerousInvisibleCharacter,
     ProblemUnescapedQuote,
     ProblemInvalidBackslashEscape,
@@ -246,6 +249,10 @@ impl Text {
             Self::PreviewFailed => ("预览失败", "Preview failed"),
             Self::RevealInFileManager => ("在文件管理器中显示", "Reveal in file manager"),
             Self::HeaderRows => ("表头行数", "Header rows"),
+            Self::MiscHeaderRowsFixed => (
+                "杂项表固定使用 2 行表头",
+                "Misc tables always use 2 header rows",
+            ),
             Self::EditorView => ("编辑器视图", "Editor view"),
             Self::Delimiter => ("分隔符", "Delimiter"),
             Self::CsvDelimiter => ("CSV 分隔符", "CSV delimiter"),
@@ -276,9 +283,14 @@ impl Text {
             Self::JsonArray2d => ("二维 JSON 数组", "two-dimensional JSON array"),
             Self::ProblemReasons => ("问题原因", "Problem reasons"),
             Self::CellValue => ("单元格值", "Cell value"),
-            Self::ProblemRealLineBreak => (
-                "包含真实换行控制字符（CR/LF）",
-                "Contains a real line-break control character (CR/LF)",
+            Self::MultilineText => ("多行文本", "Multiline text"),
+            Self::ProblemInvalidTypeDeclaration => (
+                "第一列不是有效的类型声明",
+                "The first column is not a valid type declaration",
+            ),
+            Self::ProblemDuplicateKey => (
+                "第二列包含重复 key",
+                "The second column contains a duplicate key",
             ),
             Self::ProblemDangerousInvisibleCharacter => (
                 "包含危险的不可见字符",
@@ -490,6 +502,10 @@ pub enum Message<'a> {
         detail: &'a str,
     },
     SaveCellProblems(usize),
+    DeclaredTypeMismatch {
+        expected: &'a str,
+        path: &'a str,
+    },
     StructuralMismatch(&'a str),
     Technical {
         prefix: Text,
@@ -765,6 +781,15 @@ pub fn message_for(language: Language, value: Message<'_>) -> String {
                 )
             }
         }
+        Message::DeclaredTypeMismatch { expected, path } => {
+            if zh {
+                format!("第三列的值不符合第一列声明的 {expected}（不匹配位置：{path}）")
+            } else {
+                format!(
+                    "The third-column value does not match the declared {expected} type (mismatch at {path})"
+                )
+            }
+        }
         Message::StructuralMismatch(expected) => {
             if zh {
                 format!("与该列推断出的 {expected} 结构不匹配")
@@ -952,6 +977,7 @@ pub fn count_for(language: Language, label: Count, value: usize) -> String {
         (Language::Zh, Count::ScanWarnings) => format!("{value} 个扫描警告"),
         (Language::Zh, Count::CsvErrors) => format!("{value} 个 CSV 错误"),
         (Language::Zh, Count::RedCells) => format!("{value} 个红色单元格"),
+        (Language::Zh, Count::YellowCells) => format!("{value} 个黄色单元格"),
         (Language::Zh, Count::YellowColumns) => format!("{value} 个黄色列"),
         (Language::Zh, Count::Matches) => format!("{value} 个匹配项"),
         (Language::En, Count::Files) => format!("{value} files"),
@@ -959,6 +985,7 @@ pub fn count_for(language: Language, label: Count, value: usize) -> String {
         (Language::En, Count::ScanWarnings) => format!("{value} scan warnings"),
         (Language::En, Count::CsvErrors) => format!("{value} CSV errors"),
         (Language::En, Count::RedCells) => format!("{value} red cells"),
+        (Language::En, Count::YellowCells) => format!("{value} yellow cells"),
         (Language::En, Count::YellowColumns) => format!("{value} yellow columns"),
         (Language::En, Count::Matches) => format!("{value} matches"),
     }
@@ -1017,6 +1044,7 @@ pub enum Count {
     ScanWarnings,
     CsvErrors,
     RedCells,
+    YellowCells,
     YellowColumns,
     Matches,
 }
@@ -1039,6 +1067,20 @@ mod tests {
         assert_eq!(Language::En.text(Text::Shortcuts), "Shortcuts");
         assert_eq!(Language::Zh.text(Text::Comma), "逗号");
         assert_eq!(Language::Zh.text(Text::TypeLabel), "类型");
+        assert_eq!(Language::Zh.text(Text::MultilineText), "多行文本");
+        assert_eq!(Language::En.text(Text::MultilineText), "Multiline text");
+        assert_eq!(
+            count_for(Language::Zh, Count::YellowCells, 2),
+            "2 个黄色单元格"
+        );
+        assert_eq!(
+            count_for(Language::En, Count::YellowCells, 2),
+            "2 yellow cells"
+        );
+        assert_eq!(
+            Language::Zh.text(Text::MiscHeaderRowsFixed),
+            "杂项表固定使用 2 行表头"
+        );
         assert_eq!(Language::Zh.text(Text::JsonArray2d), "二维 JSON 数组");
         assert_eq!(
             Language::Zh.text(Text::ProblemUnescapedQuote),
@@ -1086,6 +1128,16 @@ mod tests {
         assert_eq!(
             message_for(Language::En, Message::StructuralMismatch("json")),
             "Does not match the column's inferred json structure"
+        );
+        assert_eq!(
+            message_for(
+                Language::Zh,
+                Message::DeclaredTypeMismatch {
+                    expected: "{id:number}",
+                    path: "$.id"
+                }
+            ),
+            "第三列的值不符合第一列声明的 {id:number}（不匹配位置：$.id）"
         );
         assert_eq!(
             message_for(
