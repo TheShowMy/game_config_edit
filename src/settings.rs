@@ -22,7 +22,28 @@ pub struct SettingsStore {
 pub struct Settings {
     pub recent_workspace: Option<PathBuf>,
     #[serde(default)]
+    pub theme: ThemePreference,
+    #[serde(default)]
     pub workspaces: BTreeMap<PathBuf, WorkspaceSettings>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub const fn attribute(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +322,23 @@ mod tests {
             serde_json::from_str(r#"{ "recent_workspace": "C:/configs" }"#).unwrap();
 
         assert_eq!(settings.recent_workspace, Some(PathBuf::from("C:/configs")));
+        assert_eq!(settings.theme, ThemePreference::System);
         assert!(settings.workspaces.is_empty());
+    }
+
+    #[test]
+    fn theme_preferences_round_trip_and_map_to_root_attributes() {
+        for (theme, attribute) in [
+            (ThemePreference::System, "system"),
+            (ThemePreference::Light, "light"),
+            (ThemePreference::Dark, "dark"),
+        ] {
+            let encoded = serde_json::to_string(&theme).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ThemePreference>(&encoded).unwrap(),
+                theme
+            );
+            assert_eq!(theme.attribute(), attribute);
+        }
     }
 }

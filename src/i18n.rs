@@ -40,6 +40,12 @@ pub enum Text {
     OpenFolder,
     OpenCsvFolder,
     Shortcuts,
+    Theme,
+    ThemeSystem,
+    ThemeLight,
+    ThemeDark,
+    ConfigurationFiles,
+    MoreActions,
     Close,
     NoWorkspace,
     SearchConfigurations,
@@ -199,6 +205,12 @@ impl Text {
             Self::OpenFolder => ("打开文件夹", "Open folder"),
             Self::OpenCsvFolder => ("打开 CSV 配置文件夹", "Open CSV configuration folder"),
             Self::Shortcuts => ("快捷键", "Shortcuts"),
+            Self::Theme => ("主题", "Theme"),
+            Self::ThemeSystem => ("跟随系统", "System"),
+            Self::ThemeLight => ("浅色", "Light"),
+            Self::ThemeDark => ("深色", "Dark"),
+            Self::ConfigurationFiles => ("配置文件", "Configuration files"),
+            Self::MoreActions => ("更多操作", "More actions"),
             Self::Close => ("关闭", "Close"),
             Self::NoWorkspace => ("未选择工作区", "No workspace selected"),
             Self::SearchConfigurations => ("搜索配置", "Search configurations"),
@@ -1065,6 +1077,9 @@ mod tests {
     fn key_texts_are_available_in_both_languages() {
         assert_eq!(Language::Zh.text(Text::AppTitle), "游戏配置编辑器");
         assert_eq!(Language::En.text(Text::Shortcuts), "Shortcuts");
+        assert_eq!(Language::Zh.text(Text::ThemeSystem), "跟随系统");
+        assert_eq!(Language::En.text(Text::ThemeLight), "Light");
+        assert_eq!(Language::Zh.text(Text::ConfigurationFiles), "配置文件");
         assert_eq!(Language::Zh.text(Text::Comma), "逗号");
         assert_eq!(Language::Zh.text(Text::TypeLabel), "类型");
         assert_eq!(Language::Zh.text(Text::MultilineText), "多行文本");

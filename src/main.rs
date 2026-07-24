@@ -10,6 +10,11 @@ use clap::Parser;
 use dioxus::desktop::WindowCloseBehaviour;
 use dioxus::desktop::tao::event::{Event as WryEvent, WindowEvent};
 use dioxus::prelude::*;
+use dioxus_free_icons::Icon;
+use dioxus_free_icons::icons::ld_icons::{
+    LdCheck, LdEllipsis, LdFileSpreadsheet, LdFileText, LdFolderOpen, LdFolderTree, LdKeyboard,
+    LdList, LdMonitor, LdMoon, LdSave, LdSearch, LdSun, LdTable, LdX,
+};
 use game_config_edit::csv_document::{CsvDelimiter, CsvDocument, CsvEncoding, DelimiterSource};
 use game_config_edit::diagnostics::{
     CellProblemDetail, CellProblemKind, ColumnAnalysis, ProblemSeverity, TableKind, analyze_table,
@@ -34,7 +39,8 @@ use game_config_edit::search::{
     find_text_matches, rank_files, stream_workspace_search,
 };
 use game_config_edit::settings::{
-    DEFAULT_HEADER_ROWS, FilePreferences, MAX_HEADER_ROWS, MIN_HEADER_ROWS, Settings, SettingsStore,
+    DEFAULT_HEADER_ROWS, FilePreferences, MAX_HEADER_ROWS, MIN_HEADER_ROWS, Settings,
+    SettingsStore, ThemePreference,
 };
 use game_config_edit::startup::{StartupDecision, resolve_startup, validate_workspace};
 use game_config_edit::table_virtualization::{
@@ -499,6 +505,36 @@ fn show_startup_error(message: &str) {
         .show();
 }
 
+fn render_theme_icon(theme: ThemePreference, size: u32) -> Element {
+    match theme {
+        ThemePreference::System => rsx! { Icon { width: size, height: size, icon: LdMonitor } },
+        ThemePreference::Light => rsx! { Icon { width: size, height: size, icon: LdSun } },
+        ThemePreference::Dark => rsx! { Icon { width: size, height: size, icon: LdMoon } },
+    }
+}
+
+fn select_theme(
+    theme: ThemePreference,
+    store: Option<SettingsStore>,
+    mut settings: Signal<Settings>,
+    mut menu_open: Signal<bool>,
+    mut notice: Signal<Option<String>>,
+) {
+    settings.write().theme = theme;
+    if let Some(store) = store
+        && let Err(error) = store.save(&settings.read())
+    {
+        notice.set(Some(l10n(Message::Technical {
+            prefix: Text::SettingsError,
+            detail: &error.to_string(),
+        })));
+    }
+    menu_open.set(false);
+    let _ = document::eval(
+        "requestAnimationFrame(() => document.getElementById('theme-menu-trigger')?.focus({preventScroll: true}));",
+    );
+}
+
 #[allow(non_snake_case)]
 fn App() -> Element {
     let bootstrap = BOOTSTRAP.get().cloned().unwrap_or_default();
@@ -528,6 +564,7 @@ fn App() -> Element {
     let mut external_conflicts = use_signal(HashSet::<PathBuf>::new);
     let mut external_reload_errors = use_signal(HashMap::<PathBuf, String>::new);
     let mut overlay_panel = use_signal(|| None::<OverlayPanel>);
+    let mut theme_menu_open = use_signal(|| false);
     let command_palette = use_signal(CommandPaletteState::default);
     let go_to_line = use_signal(String::new);
     let current_search = use_signal(CurrentSearchState::default);
@@ -1257,6 +1294,15 @@ fn App() -> Element {
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| tr(Text::NoWorkspace).to_owned());
+    let workspace_name = workspace
+        .read()
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| root_label.clone());
+    let current_theme = app_settings.read().theme;
+    let theme_attribute = current_theme.attribute();
     let normalized_filter = filter.read().trim().to_lowercase();
     let visible_files = scan
         .read()
@@ -1380,34 +1426,49 @@ fn App() -> Element {
             }
         }
     };
+    let system_theme_store = settings_store.clone();
+    let light_theme_store = settings_store.clone();
+    let dark_theme_store = settings_store.clone();
 
     rsx! {
         document::Title { {tr(Text::AppTitle)} }
         style { {APP_CSS} }
         div {
             class: "app-shell",
+            "data-theme": theme_attribute,
             tabindex: "0",
             autofocus: true,
             onmounted: move |event| async move {
                 let _ = event.set_focus(true).await;
             },
-            onkeydown: move |event| handle_app_keydown(
-                event,
-                tabs,
-                active_tab,
-                preview,
-                preview_return_tab,
-                selected_cell,
-                cell_draft,
-                focused_column,
-                diagnostic_target,
-                table_analyses,
-                sidebar_visible,
-                overlay_panel,
-                notice,
-                shortcut_close_in_progress,
-                preview_edit_context.clone(),
-            ),
+            onkeydown: move |event| {
+                if *theme_menu_open.read() && event.key() == Key::Escape {
+                    event.prevent_default();
+                    event.stop_propagation();
+                    theme_menu_open.set(false);
+                    let _ = document::eval(
+                        "requestAnimationFrame(() => document.getElementById('theme-menu-trigger')?.focus({preventScroll: true}));",
+                    );
+                    return;
+                }
+                handle_app_keydown(
+                    event,
+                    tabs,
+                    active_tab,
+                    preview,
+                    preview_return_tab,
+                    selected_cell,
+                    cell_draft,
+                    focused_column,
+                    diagnostic_target,
+                    table_analyses,
+                    sidebar_visible,
+                    overlay_panel,
+                    notice,
+                    shortcut_close_in_progress,
+                    preview_edit_context.clone(),
+                );
+            },
             onmousemove: move |event| {
                 let Some(drag) = resize_drag.read().clone() else {
                     return;
@@ -1442,16 +1503,93 @@ fn App() -> Element {
             onmouseup: move |_| resize_drag.set(None),
             header { class: "titlebar",
                 div { class: "brand",
-                    span { class: "brand-mark", aria_hidden: "true" }
+                    Icon { class: "brand-icon", width: 20, height: 20, icon: LdFileSpreadsheet }
                     {tr(Text::AppTitle)}
                 }
-                div { class: "workspace-path", title: "{root_label}", "{root_label}" }
+                div { class: "workspace-path", title: "{root_label}", "{workspace_name}" }
                 div { class: "titlebar-actions",
+                    div { class: "theme-control",
+                        button {
+                            id: "theme-menu-trigger",
+                            class: "icon-button",
+                            title: tr(Text::Theme),
+                            aria_label: tr(Text::Theme),
+                            aria_haspopup: "menu",
+                            aria_expanded: if *theme_menu_open.read() { "true" } else { "false" },
+                            onclick: move |_| {
+                                let open = *theme_menu_open.read();
+                                theme_menu_open.set(!open);
+                            },
+                            {render_theme_icon(current_theme, 17)}
+                        }
+                        if *theme_menu_open.read() {
+                            button {
+                                class: "theme-menu-dismiss",
+                                tabindex: "-1",
+                                aria_label: tr(Text::Close),
+                                onclick: move |_| theme_menu_open.set(false),
+                            }
+                            div { class: "theme-menu", role: "menu", aria_label: tr(Text::Theme),
+                                button {
+                                    class: if current_theme == ThemePreference::System { "theme-option active" } else { "theme-option" },
+                                    role: "menuitemradio",
+                                    aria_checked: if current_theme == ThemePreference::System { "true" } else { "false" },
+                                    onclick: move |_| select_theme(
+                                        ThemePreference::System,
+                                        system_theme_store.clone(),
+                                        app_settings,
+                                        theme_menu_open,
+                                        notice,
+                                    ),
+                                    Icon { width: 16, height: 16, icon: LdMonitor }
+                                    span { {tr(Text::ThemeSystem)} }
+                                    if current_theme == ThemePreference::System {
+                                        Icon { class: "theme-check", width: 15, height: 15, icon: LdCheck }
+                                    }
+                                }
+                                button {
+                                    class: if current_theme == ThemePreference::Light { "theme-option active" } else { "theme-option" },
+                                    role: "menuitemradio",
+                                    aria_checked: if current_theme == ThemePreference::Light { "true" } else { "false" },
+                                    onclick: move |_| select_theme(
+                                        ThemePreference::Light,
+                                        light_theme_store.clone(),
+                                        app_settings,
+                                        theme_menu_open,
+                                        notice,
+                                    ),
+                                    Icon { width: 16, height: 16, icon: LdSun }
+                                    span { {tr(Text::ThemeLight)} }
+                                    if current_theme == ThemePreference::Light {
+                                        Icon { class: "theme-check", width: 15, height: 15, icon: LdCheck }
+                                    }
+                                }
+                                button {
+                                    class: if current_theme == ThemePreference::Dark { "theme-option active" } else { "theme-option" },
+                                    role: "menuitemradio",
+                                    aria_checked: if current_theme == ThemePreference::Dark { "true" } else { "false" },
+                                    onclick: move |_| select_theme(
+                                        ThemePreference::Dark,
+                                        dark_theme_store.clone(),
+                                        app_settings,
+                                        theme_menu_open,
+                                        notice,
+                                    ),
+                                    Icon { width: 16, height: 16, icon: LdMoon }
+                                    span { {tr(Text::ThemeDark)} }
+                                    if current_theme == ThemePreference::Dark {
+                                        Icon { class: "theme-check", width: 15, height: 15, icon: LdCheck }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     button {
-                        class: "open-button",
+                        class: "icon-button",
                         title: tr(Text::Shortcuts),
+                        aria_label: tr(Text::Shortcuts),
                         onclick: move |_| overlay_panel.set(Some(OverlayPanel::Shortcuts)),
-                        {tr(Text::Shortcuts)}
+                        Icon { width: 17, height: 17, icon: LdKeyboard }
                     }
                     button {
                         class: "open-button primary",
@@ -1485,7 +1623,8 @@ fn App() -> Element {
                                 workspace.set(Some(path));
                             }
                         },
-                        {tr(Text::OpenFolder)}
+                        Icon { width: 16, height: 16, icon: LdFolderOpen }
+                        span { class: "button-label", {tr(Text::OpenFolder)} }
                     }
                 }
             }
@@ -1554,29 +1693,37 @@ fn App() -> Element {
                 if *sidebar_visible.read() {
                     aside { class: "sidebar",
                     div { class: "sidebar-tools",
-                        input {
-                            class: "filter-input",
-                            r#type: "search",
-                            placeholder: tr(Text::SearchConfigurations),
-                            value: "{filter}",
-                            oninput: move |event| filter.set(event.value()),
+                        div { class: "sidebar-heading",
+                            strong { {tr(Text::ConfigurationFiles)} }
+                            span {
+                                if scan.read().loading { {tr(Text::Scanning)} } else { {count(Count::CsvFiles, file_count)} }
+                            }
+                        }
+                        div { class: "search-field",
+                            Icon { width: 15, height: 15, icon: LdSearch }
+                            input {
+                                class: "filter-input",
+                                r#type: "search",
+                                placeholder: tr(Text::SearchConfigurations),
+                                value: "{filter}",
+                                oninput: move |event| filter.set(event.value()),
+                            }
                         }
                         div { class: "sidebar-mode", role: "group", aria_label: tr(Text::FileView),
                             button {
                                 class: if *sidebar_mode.read() == SidebarMode::List { "mode-button active" } else { "mode-button" },
                                 aria_pressed: if *sidebar_mode.read() == SidebarMode::List { "true" } else { "false" },
                                 onclick: move |_| sidebar_mode.set(SidebarMode::List),
-                                {tr(Text::List)}
+                                Icon { width: 14, height: 14, icon: LdList }
+                                span { {tr(Text::List)} }
                             }
                             button {
                                 class: if *sidebar_mode.read() == SidebarMode::Tree { "mode-button active" } else { "mode-button" },
                                 aria_pressed: if *sidebar_mode.read() == SidebarMode::Tree { "true" } else { "false" },
                                 onclick: move |_| sidebar_mode.set(SidebarMode::Tree),
-                                {tr(Text::Tree)}
+                                Icon { width: 14, height: 14, icon: LdFolderTree }
+                                span { {tr(Text::Tree)} }
                             }
-                        }
-                        div { class: "scan-summary",
-                            if scan.read().loading { {tr(Text::Scanning)} } else { {count(Count::CsvFiles, file_count)} }
                         }
                     }
                     div { class: "file-list",
@@ -1635,6 +1782,21 @@ fn App() -> Element {
                                             tab_has_unsaved_changes(tab, draft_read.as_ref())
                                         })
                                 };
+                                let is_open = tabs
+                                    .read()
+                                    .iter()
+                                    .any(|tab| tab.document.path == entry.absolute_path);
+                                let is_preview = preview_path(&preview.read())
+                                    == Some(entry.absolute_path.as_path());
+                                let row_class = if is_dirty {
+                                    "file-row dirty"
+                                } else if is_open {
+                                    "file-row open"
+                                } else if is_preview {
+                                    "file-row previewing"
+                                } else {
+                                    "file-row"
+                                };
                                 let row_title = match &stats {
                                     Some(CsvFileStats::Error { message }) => {
                                         format!("{relative}: {message}")
@@ -1646,7 +1808,7 @@ fn App() -> Element {
                                 let open_file_name = entry.file_name.clone();
                                 rsx! {
                                     button {
-                                        class: "file-row",
+                                        class: row_class,
                                         key: "{relative}",
                                         style: "padding-left: {indent}px",
                                         title: "{row_title}",
@@ -1746,7 +1908,7 @@ fn App() -> Element {
                                             if is_dirty {
                                                 span { class: "dirty-dot", "●" }
                                             }
-                                            span { class: "file-icon", aria_hidden: "true" }
+                                            Icon { class: "file-icon", width: 14, height: 14, icon: LdFileSpreadsheet }
                                             span { class: "file-name", "{entry.file_name}" }
                                             span { class: "file-stats",
                                                 match stats {
@@ -1814,6 +1976,7 @@ fn App() -> Element {
                                             button {
                                                 class: "tab-close",
                                                 title: tr(Text::CloseTab),
+                                                aria_label: tr(Text::CloseTab),
                                                 onclick: move |_| {
                                                     request_close_tab(
                                                         close_path.clone(),
@@ -1826,7 +1989,7 @@ fn App() -> Element {
                                                         notice,
                                                     );
                                                 },
-                                                "×"
+                                                Icon { width: 14, height: 14, icon: LdX }
                                             }
                                         }
                                     }
@@ -1875,50 +2038,58 @@ fn App() -> Element {
                 }
             }
             footer { class: "statusbar",
-                span { {count(Count::Files, file_count)} }
-                if warning_count > 0 {
-                    span { class: "status-warning", {count(Count::ScanWarnings, warning_count)} }
+                div { class: "status-group",
+                    span { {count(Count::Files, file_count)} }
+                    if warning_count > 0 {
+                        span { class: "status-warning", {count(Count::ScanWarnings, warning_count)} }
+                    }
                 }
                 if let Some(status) = current_status {
-                    span { "{status.file_name}" }
-                    span { "{status.dimensions}" }
-                    if status.delimiter_defaulted {
-                        span { class: "status-warning", {tr(Text::DelimiterDefaulted)} }
-                    }
-                    if let Some(parse_errors) = status.parse_errors {
-                        span { class: "status-error", {count(Count::CsvErrors, parse_errors)} }
-                    } else if status.analysis_loading {
-                        span { {tr(Text::Analyzing)} }
-                    } else {
-                        if let Some(red_cells) = status.red_cells {
-                            span { class: if red_cells > 0 { "status-error" } else { "" }, {count(Count::RedCells, red_cells)} }
-                        }
-                        if let Some(yellow_cells) = status.yellow_cells {
-                            span { class: if yellow_cells > 0 { "status-warning" } else { "" }, {count(Count::YellowCells, yellow_cells)} }
-                        }
-                        if let Some(yellow_columns) = status.yellow_columns {
-                            span { class: if yellow_columns > 0 { "status-warning" } else { "" }, {count(Count::YellowColumns, yellow_columns)} }
+                    div { class: "status-group",
+                        span { "{status.file_name}" }
+                        span { "{status.dimensions}" }
+                        if status.delimiter_defaulted {
+                            span { class: "status-warning", {tr(Text::DelimiterDefaulted)} }
                         }
                     }
-                    if let Some(diagnostic) = status.diagnostic {
-                        span {
-                            class: if status.diagnostic_severity == Some(ProblemSeverity::Warning) {
-                                "status-diagnostic status-warning"
-                            } else {
-                                "status-diagnostic status-error"
-                            },
-                            title: "{diagnostic}",
-                            "{diagnostic}"
+                    div { class: "status-group status-diagnostics",
+                        if let Some(parse_errors) = status.parse_errors {
+                            span { class: "status-error", {count(Count::CsvErrors, parse_errors)} }
+                        } else if status.analysis_loading {
+                            span { {tr(Text::Analyzing)} }
+                        } else {
+                            if let Some(red_cells) = status.red_cells {
+                                span { class: if red_cells > 0 { "status-error" } else { "" }, {count(Count::RedCells, red_cells)} }
+                            }
+                            if let Some(yellow_cells) = status.yellow_cells {
+                                span { class: if yellow_cells > 0 { "status-warning" } else { "" }, {count(Count::YellowCells, yellow_cells)} }
+                            }
+                            if let Some(yellow_columns) = status.yellow_columns {
+                                span { class: if yellow_columns > 0 { "status-warning" } else { "" }, {count(Count::YellowColumns, yellow_columns)} }
+                            }
+                        }
+                        if let Some(diagnostic) = status.diagnostic {
+                            span {
+                                class: if status.diagnostic_severity == Some(ProblemSeverity::Warning) {
+                                    "status-diagnostic status-warning"
+                                } else {
+                                    "status-diagnostic status-error"
+                                },
+                                title: "{diagnostic}",
+                                "{diagnostic}"
+                            }
                         }
                     }
                     span { class: "status-spacer" }
-                    if let Some(position) = status.position {
-                        span { "{position}" }
+                    div { class: "status-group status-tail",
+                        if let Some(position) = status.position {
+                            span { "{position}" }
+                        }
+                        span { "{status.encoding}" }
                     }
-                    span { "{status.encoding}" }
                 } else {
                     span { class: "status-spacer" }
-                    span { "UTF-8" }
+                    div { class: "status-group status-tail", span { "UTF-8" } }
                 }
             }
             if let Some(panel) = *overlay_panel.read() {
@@ -2869,12 +3040,14 @@ fn render_preview(
     match preview {
         Preview::Empty => rsx! {
             div { class: "empty-editor",
+                Icon { class: "empty-icon", width: 32, height: 32, icon: LdFileSpreadsheet }
                 h1 { {tr(Text::EmptyPreviewTitle)} }
                 p { {tr(Text::EmptyPreviewBody)} }
             }
         },
         Preview::Loading { file_name, .. } => rsx! {
             div { class: "empty-editor",
+                Icon { class: "empty-icon", width: 32, height: 32, icon: LdFileSpreadsheet }
                 h1 { "{file_name}" }
                 p { {tr(Text::LoadingPreview)} }
             }
@@ -3110,9 +3283,12 @@ fn render_csv_document(
 
     rsx! {
         div { class: "preview-header",
-            div {
+            div { class: "document-identity",
                 h1 { "{title}" }
-                p { "{mode_label} · {summary}" }
+                div { class: "document-meta",
+                    span { class: if read_only { "mode-badge readonly" } else { "mode-badge editing" }, "{mode_label}" }
+                    span { "{summary}" }
+                }
                 if let Some((focus_label, focus_tooltip)) = focus_status.as_ref() {
                     p {
                         class: "focus-mode-status",
@@ -3139,7 +3315,8 @@ fn render_csv_document(
                                 table_view_context.clone(),
                                 notice,
                             ),
-                            {tr(Text::Table)}
+                            Icon { width: 14, height: 14, icon: LdTable }
+                            span { {tr(Text::Table)} }
                         }
                         button {
                             class: if view == DocumentView::Text { "active" } else { "" },
@@ -3156,87 +3333,99 @@ fn render_csv_document(
                                 preference_context.clone(),
                                 notice,
                             ),
-                            {tr(Text::Text)}
+                            Icon { width: 14, height: 14, icon: LdFileText }
+                            span { {tr(Text::Text)} }
                         }
                     }
                 }
-                if !text_view {
-                    label { class: "document-setting",
-                    span { {tr(Text::HeaderRows)} }
-                    select {
-                        aria_label: tr(Text::HeaderRows),
-                        title: if is_misc_table { tr(Text::MiscHeaderRowsFixed) } else { tr(Text::HeaderRows) },
-                        disabled: is_misc_table,
-                        value: "{header_rows}",
-                        onchange: move |event| {
-                            if let Ok(rows) = event.value().parse::<usize>() {
-                                change_header_rows(
-                                    &header_path,
-                                    rows,
-                                    read_only,
-                                    tabs,
-                                    cell_draft,
-                                    selected_cell,
-                                    diagnostic_target,
-                                    table_viewports,
-                                    header_context.clone(),
-                                    notice,
-                                );
+                details { class: "document-more",
+                    summary {
+                        class: "icon-button",
+                        title: tr(Text::MoreActions),
+                        aria_label: tr(Text::MoreActions),
+                        Icon { width: 17, height: 17, icon: LdEllipsis }
+                    }
+                    div { class: "document-more-menu",
+                        if !text_view {
+                            label { class: "document-setting",
+                                span { {tr(Text::HeaderRows)} }
+                                select {
+                                    aria_label: tr(Text::HeaderRows),
+                                    title: if is_misc_table { tr(Text::MiscHeaderRowsFixed) } else { tr(Text::HeaderRows) },
+                                    disabled: is_misc_table,
+                                    value: "{header_rows}",
+                                    onchange: move |event| {
+                                        if let Ok(rows) = event.value().parse::<usize>() {
+                                            change_header_rows(
+                                                &header_path,
+                                                rows,
+                                                read_only,
+                                                tabs,
+                                                cell_draft,
+                                                selected_cell,
+                                                diagnostic_target,
+                                                table_viewports,
+                                                header_context.clone(),
+                                                notice,
+                                            );
+                                        }
+                                    },
+                                    for rows in MIN_HEADER_ROWS..=MAX_HEADER_ROWS {
+                                        option {
+                                            value: "{rows}",
+                                            selected: rows == header_rows,
+                                            "{rows}"
+                                        }
+                                    }
+                                }
                             }
-                        },
-                        for rows in MIN_HEADER_ROWS..=MAX_HEADER_ROWS {
-                            option {
-                                value: "{rows}",
-                                selected: rows == header_rows,
-                                "{rows}"
+                            label { class: "document-setting",
+                                span { {tr(Text::Delimiter)} }
+                                select {
+                                    aria_label: tr(Text::CsvDelimiter),
+                                    value: "{delimiter.setting_value()}",
+                                    onchange: move |event| {
+                                        if let Some(delimiter) = CsvDelimiter::from_setting_value(&event.value()) {
+                                            change_delimiter(
+                                                &delimiter_path,
+                                                delimiter,
+                                                read_only,
+                                                tabs,
+                                                cell_draft,
+                                                selected_cell,
+                                                diagnostic_target,
+                                                table_viewports,
+                                                delimiter_context.clone(),
+                                                notice,
+                                            );
+                                        }
+                                    },
+                                    for option_delimiter in CsvDelimiter::ALL {
+                                        option {
+                                            value: "{option_delimiter.setting_value()}",
+                                            selected: option_delimiter == delimiter,
+                                            {localized_delimiter_label(option_delimiter)}
+                                        }
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-                    label { class: "document-setting",
-                    span { {tr(Text::Delimiter)} }
-                    select {
-                        aria_label: tr(Text::CsvDelimiter),
-                        value: "{delimiter.setting_value()}",
-                        onchange: move |event| {
-                            if let Some(delimiter) = CsvDelimiter::from_setting_value(&event.value()) {
-                                change_delimiter(
-                                    &delimiter_path,
-                                    delimiter,
-                                    read_only,
-                                    tabs,
-                                    cell_draft,
-                                    selected_cell,
-                                    diagnostic_target,
-                                    table_viewports,
-                                    delimiter_context.clone(),
-                                    notice,
-                                );
-                            }
-                        },
-                        for option_delimiter in CsvDelimiter::ALL {
-                            option {
-                                value: "{option_delimiter.setting_value()}",
-                                selected: option_delimiter == delimiter,
-                                {localized_delimiter_label(option_delimiter)}
-                            }
+                        button {
+                            class: "document-menu-action",
+                            title: "{reveal_button_label}",
+                            onclick: move |_| match reveal_in_file_manager(&reveal_path) {
+                                Ok(()) => reveal_notice.set(Some(l10n(Message::Revealed(
+                                    &file_name(&reveal_path),
+                                )))),
+                                Err(error) => reveal_notice.set(Some(l10n(Message::RevealFailed {
+                                    file: &file_name(&reveal_path),
+                                    detail: &error.to_string(),
+                                }))),
+                            },
+                            Icon { width: 15, height: 15, icon: LdFolderOpen }
+                            "{reveal_button_label}"
                         }
                     }
-                }
-                }
-                button {
-                    class: "reveal-button",
-                    title: "{reveal_button_label}",
-                    onclick: move |_| match reveal_in_file_manager(&reveal_path) {
-                        Ok(()) => reveal_notice.set(Some(l10n(Message::Revealed(
-                            &file_name(&reveal_path),
-                        )))),
-                        Err(error) => reveal_notice.set(Some(l10n(Message::RevealFailed {
-                            file: &file_name(&reveal_path),
-                            detail: &error.to_string(),
-                        }))),
-                    },
-                    "{reveal_button_label}"
                 }
                 if !read_only {
                     button {
@@ -3253,7 +3442,8 @@ fn render_csv_document(
                                 notice,
                             );
                         },
-                        {tr(Text::Save)}
+                        Icon { width: 15, height: 15, icon: LdSave }
+                        span { {tr(Text::Save)} }
                     }
                 }
             }
