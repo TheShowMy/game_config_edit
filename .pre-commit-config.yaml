@@ -1,0 +1,36 @@
+# 本地提交检查，与 .github/workflows/ci.yml 保持一致：
+#   Rust: cargo fmt --all -- --check / cargo clippy --all-targets -- -D warnings / cargo test --all-targets
+#   npm:  npm test / npm pack --dry-run（game-config-edit 主包）
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --all -- --check
+        entry: cargo fmt --all -- --check
+        language: system
+        files: ^(src/|tests/|build\.rs$|Cargo\.(toml|lock)$)
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy --all-targets -- -D warnings
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        files: ^(src/|tests/|build\.rs$|Cargo\.(toml|lock)$)
+        pass_filenames: false
+      - id: cargo-test
+        name: cargo test --all-targets
+        entry: cargo test --all-targets
+        language: system
+        files: ^(src/|tests/|build\.rs$|Cargo\.(toml|lock)$)
+        pass_filenames: false
+      - id: npm-test
+        name: npm test
+        entry: npm test
+        language: system
+        files: ^(scripts/|npm/|package\.json$)
+        pass_filenames: false
+      - id: npm-pack-dry-run
+        name: npm pack --dry-run game-config-edit
+        entry: npm pack --dry-run --workspace=false ./npm/game-config-edit
+        language: system
+        files: ^npm/game-config-edit/
+        pass_filenames: false
