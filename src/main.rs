@@ -3184,8 +3184,7 @@ fn TextEditorView(
                 .and_then(|tab| tab.text_parse_issue().cloned())
         }
     });
-    let line_numbers =
-        use_memo(move || physical_line_numbers(physical_line_count(&text.read())));
+    let line_numbers = use_memo(move || physical_line_numbers(physical_line_count(&text.read())));
     let text_value = text.read().clone();
     let line_numbers = line_numbers.read().clone();
     let parse_issue = parse_issue.read().clone();
@@ -6982,7 +6981,9 @@ mod tests {
         assert!(RESTORE_TABLE_SCROLL_JS.contains("restoredScrollTop"));
         assert!(source.contains("mutation.attributeName === \"data-path\""));
         assert!(source.contains("mutation.attributeName === \"data-scroll-top\""));
-        assert!(source.contains("attributeFilter: [\"class\", \"data-path\", \"data-scroll-top\"]"));
+        assert!(
+            source.contains("attributeFilter: [\"class\", \"data-path\", \"data-scroll-top\"]")
+        );
         assert!(source.contains("key: \"{table_key}\""));
     }
 
