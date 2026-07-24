@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "game-config-edit"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "clap",

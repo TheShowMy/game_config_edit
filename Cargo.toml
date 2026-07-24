@@ -1,6 +1,6 @@
 [package]
 name = "game-config-edit"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A desktop CSV configuration editor for game development"
 repository = "https://github.com/TheShowMy/game_config_edit"

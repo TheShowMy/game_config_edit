@@ -35,8 +35,8 @@ use game_config_edit::settings::{
 };
 use game_config_edit::startup::{StartupDecision, resolve_startup, validate_workspace};
 use game_config_edit::table_virtualization::{
-    DATA_ROW_HEIGHT, ExpandedRow, FocusColumnRole, FocusLayout, TableViewport, spacer_heights,
-    visible_row_range,
+    DATA_ROW_HEIGHT, ExpandedRow, FocusColumnRole, FocusLayout, TableViewport, row_offset,
+    spacer_heights, visible_row_range,
 };
 use game_config_edit::workspace::{
     CsvFileEntry, CsvFileStats, WorkspaceSnapshot, WorkspaceTreeRow, inspect_csv_file,
@@ -46,6 +46,15 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 use serde::Deserialize;
 
 const APP_CSS: &str = include_str!("app.css");
+const RESTORE_TABLE_SCROLL_JS: &str = r#"
+            const restoreTableScroll = (table) => {
+                const desiredScrollTop = Number.parseFloat(table.dataset.scrollTop ?? "");
+                if (!Number.isFinite(desiredScrollTop) || desiredScrollTop <= 0) return;
+                if (Math.abs(table.scrollTop - desiredScrollTop) > 0.5) {
+                    table.scrollTop = desiredScrollTop;
+                }
+            };
+"#;
 const HEADER_ROW_HEIGHT: usize = 28;
 const STATS_BATCH_SIZE: usize = 32;
 static BOOTSTRAP: OnceLock<Bootstrap> = OnceLock::new();
@@ -115,6 +124,14 @@ struct CellDraft {
 struct FocusedColumn {
     path: PathBuf,
     column_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FocusNavigation {
+    PreviousColumn,
+    NextColumn,
+    PreviousRow,
+    NextRow,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,6 +212,12 @@ struct TableViewportSize {
     path: PathBuf,
     width: f64,
     height: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct TableScrollPosition {
+    path: PathBuf,
+    scroll_top: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -339,6 +362,7 @@ enum WindowShortcutCommand {
     Paste(String),
     TextCursor(TextCursorPosition),
     TableViewport(TableViewportSize),
+    TableScroll(TableScrollPosition),
     FocusedRowHeight(FocusedRowMeasurement),
 }
 
@@ -912,7 +936,7 @@ fn App() -> Element {
     });
 
     use_future(move || async move {
-        let mut eval = document::eval(
+        let script = [
             r#"
             const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
             const handler = (event) => {
@@ -994,20 +1018,35 @@ fn App() -> Element {
                 }});
             };
             const observedTables = new Set();
+            const pendingTableSizes = new WeakSet();
+            const lastTableSizes = new WeakMap();
+            const lastFocusedRows = new WeakMap();
+            "#,
+            RESTORE_TABLE_SCROLL_JS,
+            r#"
             const measureFocusedRow = (table) => {
                 const cell = table.querySelector("td.focus-column.cell-selected[data-data-row-index]");
-                const content = cell?.querySelector(".cell-button, .cell-input");
+                const sharedContent = cell?.querySelector(".focused-row-measure");
+                const content = sharedContent ?? cell?.querySelector(".cell-button, .cell-input");
                 if (!(cell instanceof HTMLElement) || !(content instanceof HTMLElement)) return;
                 const rowIndex = Number.parseInt(cell.dataset.dataRowIndex ?? "", 10);
                 const columnIndex = Number.parseInt(cell.dataset.columnIndex ?? "", 10);
                 if (!Number.isFinite(rowIndex) || !Number.isFinite(columnIndex)) return;
-                const previousHeight = content.style.height;
-                const previousMaxHeight = content.style.maxHeight;
-                content.style.height = "0px";
-                content.style.maxHeight = "none";
-                const contentHeight = Math.max(30, content.scrollHeight + 10);
-                content.style.height = previousHeight;
-                content.style.maxHeight = previousMaxHeight;
+                let contentHeight;
+                if (sharedContent) {
+                    contentHeight = Math.max(30, sharedContent.scrollHeight + 10);
+                } else {
+                    const previousHeight = content.style.height;
+                    const previousMaxHeight = content.style.maxHeight;
+                    content.style.height = "0px";
+                    content.style.maxHeight = "none";
+                    contentHeight = Math.max(30, content.scrollHeight + 10);
+                    content.style.height = previousHeight;
+                    content.style.maxHeight = previousMaxHeight;
+                }
+                const measurementKey = `${rowIndex}:${columnIndex}:${contentHeight}`;
+                if (lastFocusedRows.get(table) === measurementKey) return;
+                lastFocusedRows.set(table, measurementKey);
                 dioxus.send({focused_row_height: {
                     path: table.dataset.path ?? "",
                     row_index: rowIndex,
@@ -1016,12 +1055,24 @@ fn App() -> Element {
                 }});
             };
             const sendTableSize = (table) => {
-                dioxus.send({table_viewport: {
-                    path: table.dataset.path ?? "",
-                    width: table.clientWidth,
-                    height: table.clientHeight,
-                }});
-                window.requestAnimationFrame(() => measureFocusedRow(table));
+                if (pendingTableSizes.has(table)) return;
+                pendingTableSizes.add(table);
+                window.requestAnimationFrame(() => {
+                    pendingTableSizes.delete(table);
+                    if (!table.isConnected) return;
+                    restoreTableScroll(table);
+                    const width = table.clientWidth;
+                    const height = table.clientHeight;
+                    const previous = lastTableSizes.get(table);
+                    if (previous?.width === width && previous?.height === height) return;
+                    lastTableSizes.set(table, {width, height});
+                    dioxus.send({table_viewport: {
+                        path: table.dataset.path ?? "",
+                        width,
+                        height,
+                    }});
+                    measureFocusedRow(table);
+                });
             };
             const resizeObserver = new ResizeObserver((entries) => {
                 for (const entry of entries) sendTableSize(entry.target);
@@ -1037,6 +1088,7 @@ fn App() -> Element {
                 for (const table of tables) {
                     if (observedTables.has(table)) continue;
                     observedTables.add(table);
+                    restoreTableScroll(table);
                     resizeObserver.observe(table);
                     sendTableSize(table);
                 }
@@ -1055,12 +1107,28 @@ fn App() -> Element {
                 }
             };
             const mutationObserver = new MutationObserver((mutations) => {
+                let measureFocused = false;
                 for (const mutation of mutations) {
+                    if (mutation.type === "attributes") {
+                        measureFocused ||= mutation.target instanceof Element
+                            && mutation.target.matches("td.focus-column, td.cell-selected");
+                        continue;
+                    }
                     for (const node of mutation.addedNodes) observeTables(node);
                     for (const node of mutation.removedNodes) unobserveTables(node);
+                    if (!measureFocused) {
+                        measureFocused = [...mutation.addedNodes, ...mutation.removedNodes].some(
+                            (node) => node instanceof Element
+                                && (node.matches(".cell-input, .cell-button")
+                                    || node.querySelector(".cell-input, .cell-button"))
+                        );
+                    }
                 }
+                if (!measureFocused) return;
                 window.requestAnimationFrame(() => {
-                    for (const table of observedTables) measureFocusedRow(table);
+                    for (const table of observedTables) {
+                        if (table.isConnected) measureFocusedRow(table);
+                    }
                 });
             });
             const inputHandler = (event) => {
@@ -1087,7 +1155,9 @@ fn App() -> Element {
             });
             await new Promise(() => {});
             "#,
-        );
+        ]
+        .concat();
+        let mut eval = document::eval(&script);
         while let Ok(command) = eval.recv::<WindowShortcutCommand>().await {
             handle_window_shortcut(
                 command,
@@ -1257,6 +1327,7 @@ fn App() -> Element {
                 preview_return_tab,
                 selected_cell,
                 cell_draft,
+                focused_column,
                 diagnostic_target,
                 table_analyses,
                 sidebar_visible,
@@ -2814,7 +2885,8 @@ fn render_csv_document(
         tr(Text::EditableTable)
     };
     let save_path = path.clone();
-    let data_row_count = document.records.len().saturating_sub(header_rows);
+    let record_count = document.records.len();
+    let data_row_count = record_count.saturating_sub(header_rows);
     let data_column_count = document.records.first().map_or(0, Vec::len);
     let focused_index = focused_column
         .read()
@@ -2854,6 +2926,9 @@ fn render_csv_document(
         selected_focus_cell
             .is_some_and(|(index, column_index)| row.matches_cell(index, column_index))
     });
+    if let Some((selected_row, _)) = selected_focus_cell {
+        viewport = viewport_with_visible_selected_row(viewport, selected_row, data_row_count);
+    }
     let visible_range = visible_row_range(data_row_count, viewport);
     let (top_spacer_height, bottom_spacer_height) =
         spacer_heights(data_row_count, &visible_range, viewport.expanded_row);
@@ -2861,6 +2936,9 @@ fn render_csv_document(
     let visible_count = visible_range.len();
     let column_count = data_column_count + 1;
     let scroll_path = path.clone();
+    let scroll_active_tab = preview_edit_context
+        .as_ref()
+        .map(|context| context.active_tab);
     let table_mode_path = path.clone();
     let table_class = if focused_index.is_some() {
         "csv-table focus-table"
@@ -3141,12 +3219,14 @@ fn render_csv_document(
                 tabindex: "0",
                 "data-path": "{path.to_string_lossy()}",
                 "data-row-height": "{DATA_ROW_HEIGHT}",
+                "data-scroll-top": "{viewport.scroll_top}",
                 "data-expanded-row-index": viewport.expanded_row.map(|row| row.index.to_string()).unwrap_or_default(),
                 "data-expanded-row-height": viewport.expanded_row.map(|row| row.height.to_string()).unwrap_or_default(),
                 onkeydown: move |event| handle_table_mode_keydown(
                     event,
                     &table_mode_path,
                     data_column_count,
+                    record_count,
                     header_rows,
                     selected_cell,
                     cell_draft,
@@ -3154,17 +3234,19 @@ fn render_csv_document(
                     diagnostic_target,
                 ),
                 onscroll: move |event| {
+                    if read_only
+                        && scroll_active_tab
+                            .as_ref()
+                            .is_some_and(|active_tab| active_tab.read().is_some())
+                    {
+                        return;
+                    }
                     let current = table_viewports
                         .read()
                         .get(&scroll_path)
                         .copied()
                         .unwrap_or_default();
-                    let next = TableViewport {
-                        scroll_top: event.data().scroll_top(),
-                        height: f64::from(event.data().client_height()),
-                        width: current.width,
-                        expanded_row: current.expanded_row,
-                    };
+                    let next = scrolled_table_viewport(current, event.data().scroll_top());
                     if visible_row_range(data_row_count, current)
                         != visible_row_range(data_row_count, next)
                     {
@@ -3409,11 +3491,13 @@ fn render_csv_document(
                                             column_index,
                                         );
                                         let display_value = editable_cell_value(value);
-                                        let highlighted_json = if is_json_cell {
-                                            editing_value.as_deref().map(syntax_highlight_json)
-                                        } else {
-                                            None
-                                        };
+                                        let highlighted_json = focused_json_highlight(
+                                            value,
+                                            editing_value.as_deref(),
+                                            is_selected,
+                                            focused_index,
+                                            column_index,
+                                        );
                                         let cell_state_class = match (has_problem, is_selected) {
                                             (true, true) => "cell-error cell-selected",
                                             (true, false) => "cell-error",
@@ -3440,8 +3524,15 @@ fn render_csv_document(
                                             source_row_index,
                                             column_index,
                                         );
+                                        let focus_input_id = cell_editor_id(
+                                            &path,
+                                            source_row_index,
+                                            column_index,
+                                        );
                                         let scroll_json_highlight_id = json_highlight_id.clone();
                                         let scroll_json_input_id = json_input_id.clone();
+                                        let mount_json_input_id = json_input_id.clone();
+                                        let mount_focus_input_id = focus_input_id.clone();
                                         rsx! {
                                             td {
                                                 class,
@@ -3451,11 +3542,11 @@ fn render_csv_document(
                                                 key: "{column_index}",
                                                 title: "{cell_title}",
                                                 if let Some(editing_value) = editing_value {
-                                                    if let Some(highlighted_json) = highlighted_json {
-                                                        div { class: "json-editor",
+                                                    if let Some(highlighted_json) = highlighted_json.as_ref() {
+                                                        div { class: "focused-json-surface json-editor",
                                                             pre {
                                                                 id: "{json_highlight_id}",
-                                                                class: "json-highlight",
+                                                                class: "json-highlight focused-row-measure",
                                                                 aria_hidden: "true",
                                                                 dangerous_inner_html: "{highlighted_json}",
                                                             }
@@ -3463,11 +3554,10 @@ fn render_csv_document(
                                                                 id: "{json_input_id}",
                                                                 class: "cell-input json-input",
                                                                 aria_label: tr(Text::JsonCellEditor),
-                                                                autofocus: true,
                                                                 spellcheck: "false",
                                                                 value: "{editing_value}",
-                                                                onmounted: move |event| async move {
-                                                                    let _ = event.set_focus(true).await;
+                                                                onmounted: move |_| {
+                                                                    initialize_cell_editor(&mount_json_input_id);
                                                                 },
                                                                 oninput: move |event| {
                                                                     if let Some(draft) = cell_draft.write().as_mut()
@@ -3498,12 +3588,12 @@ fn render_csv_document(
                                                         }
                                                     } else if use_multiline_editor {
                                                         textarea {
+                                                            id: "{focus_input_id}",
                                                             class: "cell-input focus-textarea",
-                                                            autofocus: true,
                                                             spellcheck: "false",
                                                             value: "{editing_value}",
-                                                            onmounted: move |event| async move {
-                                                                let _ = event.set_focus(true).await;
+                                                            onmounted: move |_| {
+                                                                initialize_cell_editor(&mount_focus_input_id);
                                                             },
                                                             oninput: move |event| {
                                                                 if let Some(draft) = cell_draft.write().as_mut()
@@ -3560,7 +3650,11 @@ fn render_csv_document(
                                                     }
                                                 } else {
                                                     button {
-                                                        class: "cell-button",
+                                                        class: if highlighted_json.is_some() {
+                                                            "cell-button focused-json-button"
+                                                        } else {
+                                                            "cell-button"
+                                                        },
                                                         "data-cell-value": "{value}",
                                                         onclick: move |_| {
                                                             let is_selected = selected_cell.read().as_ref()
@@ -3600,7 +3694,18 @@ fn render_csv_document(
                                                                 }
                                                             }
                                                         },
-                                                        "{display_value}"
+                                                        if let Some(highlighted_json) = highlighted_json.as_ref() {
+                                                            div { class: "focused-json-surface json-display",
+                                                                pre {
+                                                                    id: "{json_highlight_id}",
+                                                                    class: "json-highlight focused-row-measure",
+                                                                    aria_hidden: "true",
+                                                                    dangerous_inner_html: "{highlighted_json}",
+                                                                }
+                                                            }
+                                                        } else {
+                                                            "{display_value}"
+                                                        }
                                                     }
                                                 }
                                             }
@@ -3754,6 +3859,35 @@ fn json_editor_ids(path: &Path, row_index: usize, column_index: usize) -> (Strin
         .to_string();
     let base = format!("json-cell-{}-{row_index}-{column_index}", &digest[..12]);
     (format!("{base}-highlight"), format!("{base}-input"))
+}
+
+fn cell_editor_id(path: &Path, row_index: usize, column_index: usize) -> String {
+    let digest = blake3::hash(path.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string();
+    format!("cell-editor-{}-{row_index}-{column_index}", &digest[..12])
+}
+
+fn initialize_cell_editor(editor_id: &str) {
+    let _ = document::eval(&cell_editor_initialization_script(editor_id));
+}
+
+fn cell_editor_initialization_script(editor_id: &str) -> String {
+    let encoded_id = serde_json::to_string(editor_id).expect("editor id is serializable");
+    format!(
+        r#"
+        const editor = document.getElementById({encoded_id});
+        window.requestAnimationFrame(() => {{
+            if (!(editor instanceof HTMLInputElement || editor instanceof HTMLTextAreaElement)) return;
+            editor.scrollIntoView({{block: "nearest", inline: "nearest"}});
+            editor.focus({{preventScroll: true}});
+            editor.setSelectionRange(0, 0);
+            editor.scrollTop = 0;
+            editor.scrollLeft = 0;
+            editor.dispatchEvent(new Event("scroll"));
+        }});
+        "#,
+    )
 }
 
 fn json_scroll_sync_script(input_id: &str, highlight_id: &str) -> String {
@@ -4257,21 +4391,25 @@ fn handle_window_shortcut(
         }
         WindowShortcutCommand::TextCursor(position) => text_cursor.set(Some(position)),
         WindowShortcutCommand::TableViewport(size) => {
-            let mut viewports = table_viewports.write();
-            let viewport = viewports.entry(size.path).or_default();
-            if size.width.is_finite() && size.width > 0.0 {
-                viewport.width = size.width;
+            let current = table_viewports
+                .read()
+                .get(&size.path)
+                .copied()
+                .unwrap_or_default();
+            let next = resized_table_viewport(current, size.width, size.height);
+            if next != current {
+                table_viewports.write().insert(size.path, next);
             }
-            if size.height.is_finite() && size.height > 0.0 {
-                viewport.height = size.height;
-                if let Some(expanded) = viewport.expanded_row {
-                    viewport.expanded_row = Some(ExpandedRow::measured(
-                        expanded.index,
-                        expanded.column_index,
-                        expanded.height,
-                        size.height,
-                    ));
-                }
+        }
+        WindowShortcutCommand::TableScroll(position) => {
+            let current = table_viewports
+                .read()
+                .get(&position.path)
+                .copied()
+                .unwrap_or_default();
+            let next = scrolled_table_viewport(current, position.scroll_top);
+            if next != current {
+                table_viewports.write().insert(position.path, next);
             }
         }
         WindowShortcutCommand::FocusedRowHeight(measurement) => {
@@ -4290,6 +4428,46 @@ fn handle_window_shortcut(
     }
 }
 
+fn resized_table_viewport(
+    mut viewport: TableViewport,
+    measured_width: f64,
+    measured_height: f64,
+) -> TableViewport {
+    if measured_width.is_finite() && measured_width > 0.0 {
+        viewport.width = measured_width;
+    }
+    if measured_height.is_finite() && measured_height > 0.0 {
+        viewport.height = measured_height;
+        if let Some(expanded) = viewport.expanded_row {
+            viewport.expanded_row = Some(ExpandedRow::measured(
+                expanded.index,
+                expanded.column_index,
+                expanded.height,
+                measured_height,
+            ));
+        }
+    }
+    viewport
+}
+
+fn scrolled_table_viewport(mut viewport: TableViewport, scroll_top: f64) -> TableViewport {
+    if scroll_top.is_finite() && scroll_top >= 0.0 {
+        viewport.scroll_top = scroll_top;
+    }
+    viewport
+}
+
+fn viewport_with_visible_selected_row(
+    mut viewport: TableViewport,
+    selected_row: usize,
+    row_count: usize,
+) -> TableViewport {
+    if selected_row < row_count && !visible_row_range(row_count, viewport).contains(&selected_row) {
+        viewport.scroll_top = row_offset(selected_row, row_count, viewport.expanded_row);
+    }
+    viewport
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_app_keydown(
     event: KeyboardEvent,
@@ -4299,6 +4477,7 @@ fn handle_app_keydown(
     mut preview_return_tab: Signal<Option<PathBuf>>,
     mut selected_cell: Signal<Option<CellLocation>>,
     mut cell_draft: Signal<Option<CellDraft>>,
+    focused_column: Signal<Option<FocusedColumn>>,
     mut diagnostic_target: Signal<Option<DiagnosticTarget>>,
     table_analyses: Signal<HashMap<PathBuf, TableAnalysisState>>,
     mut sidebar_visible: Signal<bool>,
@@ -4393,7 +4572,8 @@ fn handle_app_keydown(
             overlay_panel.set(None);
         } else if editing {
             event.prevent_default();
-            cell_draft.set(None);
+            event.stop_propagation();
+            cancel_cell_edit(cell_draft, selected_cell);
         } else {
             diagnostic_target.set(None);
         }
@@ -4429,6 +4609,30 @@ fn handle_app_keydown(
         return;
     }
 
+    if let Some(navigation) = focus_navigation_for_key(&key, modifiers)
+        && let Some(focused) = focused_column.read().clone()
+        && let Some((column_count, row_count, header_rows)) = focus_navigation_dimensions(
+            &focused.path,
+            &tabs.read(),
+            active_tab.read().as_ref(),
+            &preview.read(),
+        )
+    {
+        event.prevent_default();
+        event.stop_propagation();
+        move_in_focus_mode(
+            &focused.path,
+            navigation,
+            column_count,
+            row_count,
+            header_rows,
+            selected_cell,
+            focused_column,
+            diagnostic_target,
+        );
+        return;
+    }
+
     let movement = match key {
         Key::ArrowUp => Some(GridMovement::Up),
         Key::ArrowDown => Some(GridMovement::Down),
@@ -4436,7 +4640,8 @@ fn handle_app_keydown(
         Key::ArrowRight => Some(GridMovement::Right),
         _ => None,
     };
-    if let Some(movement) = movement
+    if modifiers.is_empty()
+        && let Some(movement) = movement
         && let Some(path) = active_tab.read().clone()
     {
         event.prevent_default();
@@ -4444,11 +4649,46 @@ fn handle_app_keydown(
     }
 }
 
+fn focus_navigation_dimensions(
+    path: &Path,
+    tabs: &[DocumentSession],
+    active_path: Option<&PathBuf>,
+    preview: &Preview,
+) -> Option<(usize, usize, usize)> {
+    if active_path == Some(&path.to_path_buf()) {
+        return tabs
+            .iter()
+            .find(|tab| tab.document.path == path && tab.view() == DocumentView::Table)
+            .map(|tab| {
+                (
+                    tab.document.records.first().map_or(0, Vec::len),
+                    tab.document.records.len(),
+                    tab.header_rows,
+                )
+            });
+    }
+    if active_path.is_none()
+        && let Preview::Document {
+            document,
+            header_rows,
+        } = preview
+        && document.path == path
+    {
+        return Some((
+            document.records.first().map_or(0, Vec::len),
+            document.records.len(),
+            *header_rows,
+        ));
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_table_mode_keydown(
     event: KeyboardEvent,
     path: &PathBuf,
     column_count: usize,
+    row_count: usize,
     header_rows: usize,
     selected_cell: Signal<Option<CellLocation>>,
     cell_draft: Signal<Option<CellDraft>>,
@@ -4492,23 +4732,17 @@ fn handle_table_mode_keydown(
         return;
     }
 
-    let direction =
-        if modifiers.is_empty() && (key == Key::ArrowLeft || key_character_is(&key, "a")) {
-            Some(-1)
-        } else if modifiers.is_empty() && (key == Key::ArrowRight || key_character_is(&key, "d")) {
-            Some(1)
-        } else {
-            None
-        };
+    let navigation = focus_navigation_for_key(&key, modifiers);
     if current_focus.is_some()
-        && let Some(direction) = direction
+        && let Some(navigation) = navigation
     {
         event.prevent_default();
         event.stop_propagation();
-        move_focused_column(
+        move_in_focus_mode(
             path,
-            direction,
+            navigation,
             column_count,
+            row_count,
             header_rows,
             selected_cell,
             focused_column,
@@ -4517,18 +4751,65 @@ fn handle_table_mode_keydown(
     }
 }
 
-fn move_focused_column(
-    path: &PathBuf,
-    direction: isize,
+fn focus_navigation_for_key(key: &Key, modifiers: Modifiers) -> Option<FocusNavigation> {
+    if !modifiers.is_empty() {
+        return None;
+    }
+    match key {
+        Key::ArrowLeft => Some(FocusNavigation::PreviousColumn),
+        Key::ArrowRight => Some(FocusNavigation::NextColumn),
+        Key::ArrowUp => Some(FocusNavigation::PreviousRow),
+        Key::ArrowDown => Some(FocusNavigation::NextRow),
+        _ if key_character_is(key, "a") => Some(FocusNavigation::PreviousColumn),
+        _ if key_character_is(key, "d") => Some(FocusNavigation::NextColumn),
+        _ => None,
+    }
+}
+
+fn focus_navigation_position(
+    current: Option<GridPosition>,
+    focused_column: usize,
+    navigation: FocusNavigation,
+    header_rows: usize,
+    row_count: usize,
     column_count: usize,
+) -> Option<GridPosition> {
+    if row_count <= header_rows || column_count == 0 {
+        return None;
+    }
+    let current_row = current
+        .filter(|position| (header_rows..row_count).contains(&position.row_index))
+        .map_or(header_rows, |position| position.row_index);
+    let current = GridPosition {
+        row_index: current_row,
+        column_index: focused_column.min(column_count - 1),
+    };
+    let movement = match navigation {
+        FocusNavigation::PreviousColumn => GridMovement::Left,
+        FocusNavigation::NextColumn => GridMovement::Right,
+        FocusNavigation::PreviousRow => GridMovement::Up,
+        FocusNavigation::NextRow => GridMovement::Down,
+    };
+    move_in_grid(
+        Some(current),
+        header_rows,
+        row_count,
+        column_count,
+        movement,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_in_focus_mode(
+    path: &PathBuf,
+    navigation: FocusNavigation,
+    column_count: usize,
+    row_count: usize,
     header_rows: usize,
     mut selected_cell: Signal<Option<CellLocation>>,
     mut focused_column: Signal<Option<FocusedColumn>>,
     mut diagnostic_target: Signal<Option<DiagnosticTarget>>,
 ) {
-    if column_count == 0 {
-        return;
-    }
     let current_column = focused_column
         .read()
         .as_ref()
@@ -4542,40 +4823,36 @@ fn move_focused_column(
                 .map(|location| location.column_index)
         })
         .unwrap_or(0);
-    let next_column = next_focused_column(current_column, direction, column_count);
-    let row_index = selected_cell
+    let current = selected_cell
         .read()
         .as_ref()
         .filter(|location| &location.path == path)
-        .map(|location| location.row_index)
-        .unwrap_or(header_rows);
+        .map(|location| GridPosition {
+            row_index: location.row_index,
+            column_index: location.column_index,
+        });
+    let Some(position) = focus_navigation_position(
+        current,
+        current_column,
+        navigation,
+        header_rows,
+        row_count,
+        column_count,
+    ) else {
+        return;
+    };
 
     focused_column.set(Some(FocusedColumn {
         path: path.clone(),
-        column_index: next_column,
+        column_index: position.column_index,
     }));
     selected_cell.set(Some(CellLocation {
         path: path.clone(),
-        row_index,
-        column_index: next_column,
+        row_index: position.row_index,
+        column_index: position.column_index,
     }));
     diagnostic_target.set(None);
-    scroll_to_target(
-        DiagnosticTarget::Cell(GridPosition {
-            row_index,
-            column_index: next_column,
-        }),
-        header_rows,
-    );
-}
-
-fn next_focused_column(current: usize, direction: isize, column_count: usize) -> usize {
-    if column_count == 0 {
-        return 0;
-    }
-    current
-        .saturating_add_signed(direction)
-        .min(column_count - 1)
+    scroll_to_target(DiagnosticTarget::Cell(position), header_rows);
 }
 
 fn focus_column_width(max_content_chars: usize) -> usize {
@@ -4591,6 +4868,26 @@ fn cell_uses_multiline_editor(
     column_index: usize,
 ) -> bool {
     is_json || focused_column == Some(column_index)
+}
+
+fn focused_json_highlight(
+    value: &str,
+    draft: Option<&str>,
+    is_selected: bool,
+    focused_column: Option<usize>,
+    column_index: usize,
+) -> Option<String> {
+    if !is_selected || focused_column != Some(column_index) || json_structure(value).is_none() {
+        return None;
+    }
+    let display_value;
+    let rendered = if let Some(draft) = draft {
+        draft
+    } else {
+        display_value = editable_cell_value(value);
+        &display_value
+    };
+    Some(syntax_highlight_json(rendered))
 }
 
 fn cell_click_action(
@@ -4826,7 +5123,7 @@ fn handle_cell_editor_keydown(
     multiline: bool,
     indent_with_tab: bool,
     tabs: Signal<Vec<DocumentSession>>,
-    mut cell_draft: Signal<Option<CellDraft>>,
+    cell_draft: Signal<Option<CellDraft>>,
     selected_cell: Signal<Option<CellLocation>>,
     diagnostic_target: Signal<Option<DiagnosticTarget>>,
     notice: Signal<Option<String>>,
@@ -4868,11 +5165,47 @@ fn handle_cell_editor_keydown(
             }
         }
         Key::Escape => {
+            event.prevent_default();
             event.stop_propagation();
-            cell_draft.set(None);
+            cancel_cell_edit(cell_draft, selected_cell);
         }
         _ => {}
     }
+}
+
+fn cancel_cell_edit(
+    mut cell_draft: Signal<Option<CellDraft>>,
+    selected_cell: Signal<Option<CellLocation>>,
+) {
+    let focus_location = cell_draft
+        .read()
+        .as_ref()
+        .map(|draft| draft.location.clone())
+        .or_else(|| selected_cell.read().clone());
+    cell_draft.set(None);
+    if let Some(location) = focus_location {
+        let _ = document::eval(&restore_cell_focus_script(&location));
+    }
+}
+
+fn restore_cell_focus_script(location: &CellLocation) -> String {
+    let element_id = format!("cell-{}-{}", location.row_index, location.column_index);
+    format!(
+        r#"
+        const restoreCellFocus = () => {{
+            const cell = document.getElementById('{element_id}');
+            const button = cell?.querySelector('.cell-button');
+            if (!(button instanceof HTMLElement)) return false;
+            button.focus({{preventScroll: true}});
+            return true;
+        }};
+        window.requestAnimationFrame(() => {{
+            if (restoreCellFocus()) return;
+            window.setTimeout(restoreCellFocus, 60);
+            window.setTimeout(restoreCellFocus, 120);
+        }});
+        "#,
+    )
 }
 
 fn insert_editor_text(text: &str) {
@@ -4988,6 +5321,15 @@ fn promote_preview_for_edit(intent: EditIntent, mut context: PreviewEditContext)
     ) {
         return false;
     }
+    let selected_position = context
+        .selected_cell
+        .read()
+        .as_ref()
+        .map(|location| GridPosition {
+            row_index: location.row_index,
+            column_index: location.column_index,
+        })
+        .expect("eligible preview edit has a selected cell");
 
     let already_open = context
         .tabs
@@ -5019,8 +5361,8 @@ fn promote_preview_for_edit(intent: EditIntent, mut context: PreviewEditContext)
         }
     }
 
+    context.active_tab.set(Some(path.clone()));
     context.preview.set(Preview::Empty);
-    context.active_tab.set(Some(path));
     context.preview_return_tab.set(None);
     context.diagnostic_target.set(None);
     match intent {
@@ -5040,6 +5382,7 @@ fn promote_preview_for_edit(intent: EditIntent, mut context: PreviewEditContext)
             context.notice,
         ),
     }
+    scroll_to_target(DiagnosticTarget::Cell(selected_position), header_rows);
     true
 }
 
@@ -5179,42 +5522,71 @@ fn navigate_diagnostic(
 }
 
 fn scroll_to_target(target: DiagnosticTarget, header_rows: usize) {
+    let script = scroll_target_script(target, header_rows);
+    let _ = document::eval(&script);
+}
+
+fn scroll_target_script(target: DiagnosticTarget, header_rows: usize) -> String {
     let element_id = match target {
         DiagnosticTarget::Cell(position) => {
             format!("cell-{}-{}", position.row_index, position.column_index)
         }
         DiagnosticTarget::Column(column_index) => format!("type-col-{column_index}"),
     };
-    let script = format!(
+    format!(
         r#"
         const id = '{element_id}';
-        const focusTarget = () => {{
+        const revealTarget = () => {{
             const element = document.getElementById(id);
-            element?.scrollIntoView({{block: 'nearest', inline: 'center'}});
-            (element?.querySelector('button') ?? element)?.focus();
-            return element !== null;
-        }};
-        if (!focusTarget() && id.startsWith('cell-')) {{
-            const sourceRow = Number.parseInt(id.split('-')[1], 10);
-            const scroller = document.querySelector('.table-scroll');
-            if (scroller && Number.isFinite(sourceRow)) {{
-                const rowHeight = Number.parseFloat(scroller.dataset.rowHeight) || {DATA_ROW_HEIGHT};
-                const dataRow = Math.max(0, sourceRow - {header_rows});
-                const expandedRow = Number.parseInt(scroller.dataset.expandedRowIndex ?? "", 10);
-                const expandedHeight = Number.parseFloat(scroller.dataset.expandedRowHeight ?? "");
-                const expandedOffset = Number.isFinite(expandedRow)
-                    && Number.isFinite(expandedHeight)
-                    && expandedRow < dataRow
-                    ? Math.max(0, expandedHeight - rowHeight)
-                    : 0;
-                scroller.scrollTop = dataRow * rowHeight + expandedOffset;
-                window.setTimeout(focusTarget, 60);
+            if (element && !id.startsWith('cell-')) {{
+                element.scrollIntoView({{block: 'nearest', inline: 'center'}});
+                (element.querySelector('textarea, input, button') ?? element)
+                    .focus({{preventScroll: true}});
+                return true;
             }}
-        }}
-        window.setTimeout(focusTarget, 80);
+            if (!id.startsWith('cell-')) return false;
+
+            const sourceRow = Number.parseInt(id.split('-')[1], 10);
+            const scroller = element?.closest('.table-scroll')
+                ?? document.querySelector('.table-scroll');
+            if (!scroller || !Number.isFinite(sourceRow)) return false;
+
+            if (element) {{
+                const elementRect = element.getBoundingClientRect();
+                const scrollerRect = scroller.getBoundingClientRect();
+                if (elementRect.top >= scrollerRect.top
+                    && elementRect.bottom <= scrollerRect.bottom) {{
+                    element.scrollIntoView({{block: 'nearest', inline: 'center'}});
+                    (element.querySelector('textarea, input, button') ?? element)
+                        .focus({{preventScroll: true}});
+                    return true;
+                }}
+            }}
+
+            const rowHeight = Number.parseFloat(scroller.dataset.rowHeight) || {DATA_ROW_HEIGHT};
+            const dataRow = Math.max(0, sourceRow - {header_rows});
+            const expandedRow = Number.parseInt(scroller.dataset.expandedRowIndex ?? "", 10);
+            const expandedHeight = Number.parseFloat(scroller.dataset.expandedRowHeight ?? "");
+            const expandedOffset = Number.isFinite(expandedRow)
+                && Number.isFinite(expandedHeight)
+                && expandedRow < dataRow
+                ? Math.max(0, expandedHeight - rowHeight)
+                : 0;
+            scroller.scrollTop = dataRow * rowHeight + expandedOffset;
+            dioxus.send({{table_scroll: {{
+                path: scroller.dataset.path ?? "",
+                scroll_top: scroller.scrollTop,
+            }}}});
+            return false;
+        }};
+        revealTarget();
+        window.requestAnimationFrame(revealTarget);
+        window.setTimeout(revealTarget, 60);
+        window.setTimeout(revealTarget, 140);
+        window.setTimeout(revealTarget, 300);
+        window.setTimeout(revealTarget, 500);
         "#,
-    );
-    let _ = document::eval(&script);
+    )
 }
 
 fn attempt_save_tab(
@@ -6014,6 +6386,60 @@ mod tests {
     }
 
     #[test]
+    fn table_viewport_recovers_from_a_transient_short_measurement() {
+        let short = resized_table_viewport(TableViewport::default(), 1_900.0, 30.0);
+        let recovered = resized_table_viewport(short, 1_900.0, 960.0);
+
+        assert_eq!(short.height, 30.0);
+        assert_eq!(recovered.height, 960.0);
+        assert_eq!(recovered.width, 1_900.0);
+    }
+
+    #[test]
+    fn repeated_table_viewport_measurements_do_not_change_state() {
+        let viewport = TableViewport {
+            width: 1_900.0,
+            height: 960.0,
+            ..TableViewport::default()
+        };
+
+        assert_eq!(resized_table_viewport(viewport, 1_900.0, 960.0), viewport);
+    }
+
+    #[test]
+    fn scrolling_updates_position_without_overwriting_measured_viewport_dimensions() {
+        let initial = TableViewport {
+            width: 1_900.0,
+            height: 960.0,
+            expanded_row: Some(ExpandedRow::measured(99, 11, 120.0, 960.0)),
+            ..TableViewport::default()
+        };
+        let viewport = scrolled_table_viewport(initial, 2_970.0);
+
+        assert_eq!(viewport.scroll_top, 2_970.0);
+        assert_eq!(viewport.width, 1_900.0);
+        assert_eq!(viewport.height, 960.0);
+        assert_eq!(viewport.expanded_row, initial.expanded_row);
+        assert_eq!(scrolled_table_viewport(viewport, f64::NAN), viewport);
+    }
+
+    #[test]
+    fn focused_selection_outside_the_virtual_window_is_rendered_immediately() {
+        let viewport = TableViewport {
+            width: 1_000.0,
+            height: 360.0,
+            ..TableViewport::default()
+        };
+
+        let moved = viewport_with_visible_selected_row(viewport, 99, 137);
+        assert!(visible_row_range(137, moved).contains(&99));
+        assert_eq!(moved.scroll_top, 2_970.0);
+
+        let unchanged = viewport_with_visible_selected_row(moved, 100, 137);
+        assert_eq!(unchanged, moved);
+    }
+
+    #[test]
     fn focused_plain_text_and_json_use_multiline_editors() {
         assert!(cell_uses_multiline_editor(false, Some(2), 2));
         assert!(!cell_uses_multiline_editor(false, Some(2), 1));
@@ -6021,10 +6447,63 @@ mod tests {
     }
 
     #[test]
+    fn only_the_selected_focused_json_cell_is_highlighted() {
+        let value = r#"{"mid":1,"name":"hello"}"#;
+
+        assert!(focused_json_highlight(value, None, true, Some(2), 2).is_some());
+        assert!(focused_json_highlight(value, None, false, Some(2), 2).is_none());
+        assert!(focused_json_highlight(value, None, true, Some(1), 2).is_none());
+        assert!(focused_json_highlight("plain text", None, true, Some(2), 2).is_none());
+    }
+
+    #[test]
+    fn focused_json_display_and_editor_share_the_same_highlighted_content() {
+        for value in [
+            r#"{"mid":1,"name":"hello"}"#,
+            r#"["a","b"]"#,
+            r#"[[1,2],[3,4]]"#,
+        ] {
+            let draft = editable_cell_value(value);
+            assert_eq!(
+                focused_json_highlight(value, None, true, Some(2), 2),
+                focused_json_highlight(value, Some(&draft), true, Some(2), 2),
+            );
+        }
+    }
+
+    #[test]
     fn focused_row_css_hard_caps_the_row_and_inner_scroller() {
         assert!(APP_CSS.contains("max-height: var(--focused-row-height)"));
         assert!(APP_CSS.contains("max-height: calc(var(--focused-row-height, 30px) - 10px)"));
         assert!(APP_CSS.contains(".focus-textarea"));
+        assert!(APP_CSS.contains(".focused-json-surface"));
+        assert!(APP_CSS.contains(".json-display .json-highlight"));
+        assert!(APP_CSS.contains("white-space: pre"));
+    }
+
+    #[test]
+    fn remounted_virtual_table_restores_its_saved_scroll_position() {
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("table.dataset.scrollTop"));
+        assert!(RESTORE_TABLE_SCROLL_JS.contains("table.scrollTop = desiredScrollTop"));
+    }
+
+    #[test]
+    fn target_reveal_retries_after_remount_and_focuses_the_editor() {
+        let script = scroll_target_script(
+            DiagnosticTarget::Cell(GridPosition {
+                row_index: 100,
+                column_index: 11,
+            }),
+            2,
+        );
+
+        assert!(script.contains("window.requestAnimationFrame(revealTarget)"));
+        assert!(script.contains("window.setTimeout(revealTarget, 140)"));
+        assert!(script.contains("window.setTimeout(revealTarget, 500)"));
+        assert!(script.contains("elementRect.bottom <= scrollerRect.bottom"));
+        assert!(script.contains("scroller.scrollTop = dataRow * rowHeight + expandedOffset"));
+        assert!(script.contains("textarea, input, button"));
+        assert!(script.contains("const dataRow = Math.max(0, sourceRow - 2)"));
     }
 
     #[test]
@@ -6125,11 +6604,115 @@ mod tests {
     }
 
     #[test]
-    fn focused_column_navigation_uses_the_rendered_document_column_count() {
-        assert_eq!(next_focused_column(0, -1, 5), 0);
-        assert_eq!(next_focused_column(2, 1, 5), 3);
-        assert_eq!(next_focused_column(4, 1, 5), 4);
-        assert_eq!(next_focused_column(0, 1, 0), 0);
+    fn focus_mode_maps_unmodified_navigation_keys_and_ignores_modifiers() {
+        assert_eq!(
+            focus_navigation_for_key(&Key::ArrowLeft, Modifiers::empty()),
+            Some(FocusNavigation::PreviousColumn)
+        );
+        assert_eq!(
+            focus_navigation_for_key(&Key::ArrowRight, Modifiers::empty()),
+            Some(FocusNavigation::NextColumn)
+        );
+        assert_eq!(
+            focus_navigation_for_key(&Key::ArrowUp, Modifiers::empty()),
+            Some(FocusNavigation::PreviousRow)
+        );
+        assert_eq!(
+            focus_navigation_for_key(&Key::ArrowDown, Modifiers::empty()),
+            Some(FocusNavigation::NextRow)
+        );
+        assert_eq!(
+            focus_navigation_for_key(&Key::Character("A".into()), Modifiers::empty()),
+            Some(FocusNavigation::PreviousColumn)
+        );
+        assert_eq!(
+            focus_navigation_for_key(&Key::Character("d".into()), Modifiers::empty()),
+            Some(FocusNavigation::NextColumn)
+        );
+        assert_eq!(
+            focus_navigation_for_key(&Key::ArrowDown, Modifiers::SHIFT),
+            None
+        );
+        assert_eq!(
+            focus_navigation_for_key(&Key::ArrowLeft, Modifiers::CONTROL),
+            None
+        );
+    }
+
+    #[test]
+    fn focus_mode_navigation_uses_rendered_document_dimensions_and_clamps_boundaries() {
+        let current = Some(GridPosition {
+            row_index: 2,
+            column_index: 0,
+        });
+        let position =
+            |navigation| focus_navigation_position(current, 2, navigation, 2, 5, 4).unwrap();
+
+        assert_eq!(
+            position(FocusNavigation::PreviousRow),
+            GridPosition {
+                row_index: 2,
+                column_index: 2,
+            }
+        );
+        assert_eq!(
+            position(FocusNavigation::NextRow),
+            GridPosition {
+                row_index: 3,
+                column_index: 2,
+            }
+        );
+        assert_eq!(
+            position(FocusNavigation::PreviousColumn),
+            GridPosition {
+                row_index: 2,
+                column_index: 1,
+            }
+        );
+        assert_eq!(
+            position(FocusNavigation::NextColumn),
+            GridPosition {
+                row_index: 2,
+                column_index: 3,
+            }
+        );
+
+        assert_eq!(
+            focus_navigation_position(
+                Some(GridPosition {
+                    row_index: 4,
+                    column_index: 3,
+                }),
+                3,
+                FocusNavigation::NextRow,
+                2,
+                5,
+                4,
+            ),
+            Some(GridPosition {
+                row_index: 4,
+                column_index: 3,
+            })
+        );
+        assert_eq!(
+            focus_navigation_position(None, 1, FocusNavigation::NextRow, 2, 2, 4),
+            None
+        );
+    }
+
+    #[test]
+    fn cancelling_an_editor_restores_the_original_cell_without_scrolling() {
+        let script = restore_cell_focus_script(&CellLocation {
+            path: PathBuf::from("heroes.csv"),
+            row_index: 4,
+            column_index: 2,
+        });
+
+        assert!(script.contains("cell-4-2"));
+        assert!(script.contains("requestAnimationFrame"));
+        assert!(script.contains("setTimeout(restoreCellFocus, 60)"));
+        assert!(script.contains("focus({preventScroll: true})"));
+        assert!(script.contains(".cell-button"));
     }
 
     #[test]
@@ -6321,5 +6904,27 @@ mod tests {
         assert_ne!(first, other);
         assert!(script.contains("highlight.scrollTop = input.scrollTop"));
         assert!(script.contains("highlight.scrollLeft = input.scrollLeft"));
+    }
+
+    #[test]
+    fn focused_editor_initialization_starts_at_the_content_origin() {
+        let first = cell_editor_id(Path::new("heroes.csv"), 3, 2);
+        let second = cell_editor_id(Path::new("heroes.csv"), 3, 2);
+        let other = cell_editor_id(Path::new("heroes.csv"), 4, 2);
+        let script = cell_editor_initialization_script(&first);
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert!(script.contains("requestAnimationFrame"));
+        assert!(script.contains("scrollIntoView({block: \"nearest\", inline: \"nearest\"})"));
+        assert!(script.contains("focus({preventScroll: true})"));
+        assert!(script.contains("setSelectionRange(0, 0)"));
+        assert!(script.contains("scrollTop = 0"));
+        assert!(script.contains("scrollLeft = 0"));
+        assert!(script.contains("dispatchEvent(new Event(\"scroll\"))"));
+        assert!(
+            script.find("scrollIntoView").expect("scroll positioning")
+                < script.find("focus(").expect("editor focus")
+        );
     }
 }
