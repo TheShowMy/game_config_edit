@@ -417,6 +417,7 @@ fn main() {
     let bootstrap = build_bootstrap(cli.workspace);
     let _ = BOOTSTRAP.set(bootstrap);
     let config = dioxus::desktop::Config::new()
+        .with_window(dioxus::desktop::WindowBuilder::new().with_always_on_top(false))
         .with_menu(None::<dioxus::desktop::muda::Menu>)
         .with_close_behaviour(WindowCloseBehaviour::WindowHides);
     #[cfg(target_os = "macos")]
@@ -608,6 +609,54 @@ fn App() -> Element {
                 desktop.set_close_behavior(WindowCloseBehaviour::WindowHides);
                 restore_hidden_window(desktop.clone());
             }
+        }
+    });
+
+    // 聚焦模式：仅在选中单元格/聚焦列/标签页变化时把视口回弹到选中行。
+    // 鼠标滚动不触发此 effect，避免渲染时回弹与 DOM 实际滚动位置脱节导致空白。
+    use_effect(move || {
+        let mut table_viewports = table_viewports;
+        let (Some(focused), Some(location), Some(active)) = (
+            focused_column.read().clone(),
+            selected_cell.read().clone(),
+            active_tab.read().clone(),
+        ) else {
+            return;
+        };
+        if focused.path != active || location.path != active {
+            return;
+        }
+        let Some((header_rows, data_row_count, data_column_count)) = tabs
+            .peek()
+            .iter()
+            .find(|tab| tab.document.path == active)
+            .map(|tab| {
+                let header_rows =
+                    effective_header_rows(tab.document.records.as_ref(), tab.header_rows);
+                (
+                    header_rows,
+                    tab.document.records.len().saturating_sub(header_rows),
+                    tab.document.records.first().map_or(0, Vec::len),
+                )
+            })
+        else {
+            return;
+        };
+        if location.column_index != focused.column_index
+            || focused.column_index >= data_column_count
+            || location.row_index < header_rows
+        {
+            return;
+        }
+        let selected_row = location.row_index - header_rows;
+        let viewport = table_viewports
+            .peek()
+            .get(&active)
+            .copied()
+            .unwrap_or_default();
+        let snapped = viewport_with_visible_selected_row(viewport, selected_row, data_row_count);
+        if snapped.scroll_top != viewport.scroll_top {
+            table_viewports.write().insert(active, snapped);
         }
     });
 
@@ -1219,6 +1268,22 @@ fn App() -> Element {
                             sendTableSize(mutation.target);
                             continue;
                         }
+                        if (mutation.target instanceof HTMLElement
+                            && mutation.target.matches(".table-scroll[data-path]")
+                            && mutation.attributeName === "data-scroll-top") {
+                            const desired = Number.parseFloat(mutation.target.dataset.scrollTop ?? "");
+                            const lastReported = mutation.target.__lastReportedScrollTop;
+                            const lastEventAt = mutation.target.__lastScrollEventAt;
+                            if (!Number.isFinite(desired)
+                                || (typeof lastReported === "number"
+                                    && Math.abs(desired - lastReported) <= 0.5)
+                                || (typeof lastEventAt === "number"
+                                    && performance.now() - lastEventAt < 150)) {
+                                continue;
+                            }
+                            scheduleTableScrollRestore(mutation.target);
+                            continue;
+                        }
                         measureFocused ||= mutation.target instanceof Element
                             && mutation.target.matches("td.focus-column, td.cell-selected");
                         continue;
@@ -1255,12 +1320,19 @@ fn App() -> Element {
             window.addEventListener("paste", pasteHandler, true);
             document.addEventListener("selectionchange", cursorHandler, true);
             document.addEventListener("input", inputHandler, true);
+            document.addEventListener("scroll", (event) => {
+                if (event.target instanceof HTMLElement
+                    && event.target.matches(".table-scroll[data-path]")) {
+                    event.target.__lastReportedScrollTop = event.target.scrollTop;
+                    event.target.__lastScrollEventAt = performance.now();
+                }
+            }, true);
             observeTables(document);
             mutationObserver.observe(document.body, {
                 childList: true,
                 subtree: true,
                 attributes: true,
-                attributeFilter: ["class", "data-path"],
+                attributeFilter: ["class", "data-path", "data-scroll-top"],
             });
             await new Promise(() => {});
             "#,
@@ -2003,7 +2075,6 @@ fn App() -> Element {
                                 &session.document,
                                 session.text(),
                                 session.view(),
-                                session.text_parse_issue(),
                                 false,
                                 session.header_rows,
                                 tabs,
@@ -3067,7 +3138,6 @@ fn render_preview(
             document,
             &document.raw_text,
             DocumentView::Table,
-            None,
             true,
             *header_rows,
             tabs,
@@ -3085,12 +3155,92 @@ fn render_preview(
     }
 }
 
+/// 文本编辑器视图。独立组件 + memo 缓存，避免 App 无关重渲染时
+/// 反复克隆整个文档文本、重建行号并 diff 巨型 textarea value。
+#[component]
+fn TextEditorView(
+    path: PathBuf,
+    tabs: Signal<Vec<DocumentSession>>,
+    notice: Signal<Option<String>>,
+) -> Element {
+    let editor_id = text_editor_id(&path);
+    let gutter_id = format!("{editor_id}-lines");
+    let text = use_memo({
+        let path = path.clone();
+        move || {
+            tabs.read()
+                .iter()
+                .find(|tab| tab.document.path == path)
+                .map(|tab| tab.text().to_owned())
+                .unwrap_or_default()
+        }
+    });
+    let parse_issue = use_memo({
+        let path = path.clone();
+        move || {
+            tabs.read()
+                .iter()
+                .find(|tab| tab.document.path == path)
+                .and_then(|tab| tab.text_parse_issue().cloned())
+        }
+    });
+    let line_numbers =
+        use_memo(move || physical_line_numbers(physical_line_count(&text.read())));
+    let text_value = text.read().clone();
+    let line_numbers = line_numbers.read().clone();
+    let parse_issue = parse_issue.read().clone();
+    let scroll_editor_id = editor_id.clone();
+    let scroll_gutter_id = gutter_id.clone();
+    let input_path = path.clone();
+    let mut input_tabs = tabs;
+    let mut input_notice = notice;
+
+    rsx! {
+        div { class: "text-view",
+            if let Some(issue) = parse_issue {
+                div { class: "text-parse-error", title: "{issue.message}",
+                    strong { {csv_parse_failed(issue.count)} }
+                    span { "{issue.message}" }
+                }
+            }
+            div { class: "text-editor-shell",
+                pre {
+                    id: "{gutter_id}",
+                    class: "text-line-numbers",
+                    aria_hidden: "true",
+                    "{line_numbers}"
+                }
+                textarea {
+                    id: "{editor_id}",
+                    class: "text-editor-input",
+                    "data-path": "{path.to_string_lossy()}",
+                    aria_label: tr(Text::CsvTextEditor),
+                    spellcheck: "false",
+                    wrap: "off",
+                    value: "{text_value}",
+                    oninput: move |event| {
+                        if let Some(tab) = input_tabs
+                            .write()
+                            .iter_mut()
+                            .find(|tab| tab.document.path == input_path)
+                            && tab.set_text(event.value())
+                        {
+                            input_notice.set(None);
+                        }
+                    },
+                    onkeydown: move |event| event.stop_propagation(),
+                    onscroll: move |_| sync_text_editor_scroll(&scroll_editor_id, &scroll_gutter_id),
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_csv_document(
     document: &CsvDocument,
     text: &str,
     view: DocumentView,
-    text_parse_issue: Option<&TextParseIssue>,
     read_only: bool,
     header_rows: usize,
     tabs: Signal<Vec<DocumentSession>>,
@@ -3187,9 +3337,6 @@ fn render_csv_document(
         selected_focus_cell
             .is_some_and(|(index, column_index)| row.matches_cell(index, column_index))
     });
-    if let Some((selected_row, _)) = selected_focus_cell {
-        viewport = viewport_with_visible_selected_row(viewport, selected_row, data_row_count);
-    }
     let visible_range = visible_row_range(data_row_count, viewport);
     let (top_spacer_height, bottom_spacer_height) =
         spacer_heights(data_row_count, &visible_range, viewport.expanded_row);
@@ -3258,24 +3405,6 @@ fn render_csv_document(
     let table_view_path = path.clone();
     let table_view_context = preference_context.clone();
     let text_view_path = path.clone();
-    let text_input_path = path.clone();
-    let mut text_tabs = tabs;
-    let mut text_notice = notice;
-    let text_value = if text_view {
-        text.to_owned()
-    } else {
-        String::new()
-    };
-    let line_numbers = if text_view {
-        physical_line_numbers(line_count)
-    } else {
-        String::new()
-    };
-    let editor_id = text_editor_id(&path);
-    let gutter_id = format!("{editor_id}-lines");
-    let scroll_editor_id = editor_id.clone();
-    let scroll_gutter_id = gutter_id.clone();
-    let parse_issue = text_parse_issue.cloned();
     let table_analyses = preference_context.table_analyses;
     let reveal_path = path.clone();
     let mut reveal_notice = notice;
@@ -3449,45 +3578,10 @@ fn render_csv_document(
             }
         }
         if text_view {
-            div { class: "text-view",
-                if let Some(issue) = parse_issue {
-                    div { class: "text-parse-error", title: "{issue.message}",
-                        strong { {csv_parse_failed(issue.count)} }
-                        span { "{issue.message}" }
-                    }
-                }
-                div { class: "text-editor-shell",
-                    pre {
-                        id: "{gutter_id}",
-                        class: "text-line-numbers",
-                        aria_hidden: "true",
-                        "{line_numbers}"
-                    }
-                    textarea {
-                        id: "{editor_id}",
-                        class: "text-editor-input",
-                        "data-path": "{path.to_string_lossy()}",
-                        aria_label: tr(Text::CsvTextEditor),
-                        spellcheck: "false",
-                        wrap: "off",
-                        value: "{text_value}",
-                        oninput: move |event| {
-                            if let Some(tab) = text_tabs
-                                .write()
-                                .iter_mut()
-                                .find(|tab| tab.document.path == text_input_path)
-                                && tab.set_text(event.value())
-                            {
-                                text_notice.set(None);
-                            }
-                        },
-                        onkeydown: move |event| event.stop_propagation(),
-                        onscroll: move |_| sync_text_editor_scroll(
-                            &scroll_editor_id,
-                            &scroll_gutter_id,
-                        ),
-                    }
-                }
+            TextEditorView {
+                path: path.clone(),
+                tabs,
+                notice,
             }
         } else if document.records.len() < header_rows {
             div { class: "preview-error",
@@ -3721,10 +3815,18 @@ fn render_csv_document(
                         for (source_row_index, record) in document.records.iter().enumerate().skip(visible_start).take(visible_count) {
                             tr {
                                 key: "{source_row_index}",
-                                class: if viewport.expanded_row.is_some_and(|row| row.index == source_row_index - header_rows) {
-                                    "focus-expanded-row"
-                                } else {
-                                    ""
+                                class: {
+                                    let mut classes = String::new();
+                                    if (source_row_index - header_rows) % 2 == 1 {
+                                        classes.push_str("row-alt");
+                                    }
+                                    if viewport.expanded_row.is_some_and(|row| row.index == source_row_index - header_rows) {
+                                        if !classes.is_empty() {
+                                            classes.push(' ');
+                                        }
+                                        classes.push_str("focus-expanded-row");
+                                    }
+                                    classes
                                 },
                                 style: if viewport.expanded_row.is_some_and(|row| row.index == source_row_index - header_rows) {
                                     format!(
@@ -6459,24 +6561,16 @@ fn cell_problem_reasons(
         .collect()
 }
 
-fn cell_tooltip(value: &str, reasons: &[String], is_multiline: bool) -> String {
-    if reasons.is_empty() && !is_multiline {
-        return value.to_owned();
+fn cell_tooltip(_value: &str, reasons: &[String], _is_multiline: bool) -> String {
+    if reasons.is_empty() {
+        return String::new();
     }
-    let mut sections = Vec::new();
-    if is_multiline {
-        sections.push(tr(Text::MultilineText).to_owned());
-    }
-    if !reasons.is_empty() {
-        let reasons = reasons
-            .iter()
-            .map(|reason| format!("- {reason}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        sections.push(format!("{}:\n{reasons}", tr(Text::ProblemReasons)));
-    }
-    sections.push(format!("{}:\n{value}", tr(Text::CellValue)));
-    sections.join("\n\n")
+    let reasons = reasons
+        .iter()
+        .map(|reason| format!("- {reason}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{}:\n{reasons}", tr(Text::ProblemReasons))
 }
 
 fn column_problem_summary(analysis: &ColumnAnalysis) -> String {
@@ -6887,8 +6981,8 @@ mod tests {
         assert!(RESTORE_TABLE_SCROLL_JS.contains("scheduledScrollTop"));
         assert!(RESTORE_TABLE_SCROLL_JS.contains("restoredScrollTop"));
         assert!(source.contains("mutation.attributeName === \"data-path\""));
-        assert!(!source.contains("mutation.attributeName === \"data-scroll-top\""));
-        assert!(source.contains("attributeFilter: [\"class\", \"data-path\"]"));
+        assert!(source.contains("mutation.attributeName === \"data-scroll-top\""));
+        assert!(source.contains("attributeFilter: [\"class\", \"data-path\", \"data-scroll-top\"]"));
         assert!(source.contains("key: \"{table_key}\""));
     }
 
@@ -7235,7 +7329,7 @@ mod tests {
         assert_eq!(all_reasons.len(), CELL_PROBLEM_KINDS.len());
         assert!(all_reasons.iter().all(|reason| !reason.is_empty()));
         assert!(tooltip.contains(tr(Text::ProblemReasons)));
-        assert!(tooltip.contains("broken"));
+        assert!(!tooltip.contains("broken"));
         assert!(summary.contains("(1)"));
         assert!(type_tooltip.contains("{id:number}"));
         assert!(type_tooltip.contains(summary.as_str()));
@@ -7248,7 +7342,7 @@ mod tests {
         assert_eq!(status.diagnostic_severity, Some(ProblemSeverity::Error));
         assert_eq!(status.red_cells, Some(1));
         assert_eq!(status.yellow_cells, Some(0));
-        assert_eq!(cell_tooltip("plain", &[], false), "plain");
+        assert_eq!(cell_tooltip("plain", &[], false), "");
     }
 
     #[test]
@@ -7281,8 +7375,7 @@ mod tests {
         );
 
         let tooltip = cell_tooltip("first\nsecond", &[], true);
-        assert!(tooltip.contains(tr(Text::MultilineText)));
-        assert!(tooltip.contains("first\nsecond"));
+        assert!(tooltip.is_empty());
     }
 
     #[test]

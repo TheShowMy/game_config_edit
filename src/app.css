@@ -1162,10 +1162,14 @@ summary:focus-visible {
 
 .csv-table thead th {
   position: sticky;
-  z-index: 2;
+  z-index: 4;
   background: var(--table-header);
   color: var(--text-primary);
   text-align: left;
+}
+
+.csv-table thead th.row-number {
+  z-index: 5;
 }
 
 .csv-table .row-number-column {
@@ -1216,8 +1220,8 @@ summary:focus-visible {
   font-weight: 400;
 }
 
-.csv-table tbody tr:not(.virtual-spacer):nth-child(even) > td,
-.csv-table tbody tr:not(.virtual-spacer):nth-child(even) > th {
+.csv-table tbody tr.row-alt > td,
+.csv-table tbody tr.row-alt > th {
   background: var(--row-alternate);
 }
 
